@@ -12,4 +12,4 @@ Once indicator is shown, it has 0% effect on frame times in my test (approximati
 
 Program draws top-most window as efficiently as possible (presumably). Minimizes to tray, auto-starts to tray as well.
 
-You need to enable WebSocket server in obs (Tools -> WebSocket Server Settings). Supports password authentication, saves password encrypted in config and should not unnecessarily keep unencrypted password in RAM.
+You need to enable WebSocket server in obs (Tools -> WebSocket Server Settings). Supports password authentication, saves password encrypted in config and should not unnecessarily keep unencrypted password in RAM. Might be AI generated.
