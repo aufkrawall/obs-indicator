@@ -1,4 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define _WIN32_WINNT 0x0A00
+#define WINVER 0x0A00
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
@@ -338,10 +340,38 @@ void NetThread() {
           key + "\r\nSec-WebSocket-Version: 13\r\n\r\n";
       send(s, req.c_str(), (int)req.size(), 0);
 
+      // Robust Handshake Handling
       char buf[4096];
-      if (recv(s, buf, 4096, 0) > 0 && strstr(buf, "101")) {
-        int n = recv(s, buf, 4096, 0);
-        std::string hello(buf, n > 0 ? n : 0);
+      std::string bufStr;
+      bool handshakeDone = false;
+
+      // Read until we get the full header
+      while (!handshakeDone) {
+        int r = recv(s, buf, sizeof(buf), 0);
+        if (r <= 0)
+          break;
+        bufStr.append(buf, r);
+
+        if (bufStr.find("\r\n\r\n") != std::string::npos) {
+          handshakeDone = true;
+        }
+      }
+
+      if (handshakeDone && bufStr.find("101") != std::string::npos) {
+        // Check if we have extra data (the body) in the buffer
+        size_t headerEnd = bufStr.find("\r\n\r\n") + 4;
+        std::string hello;
+
+        if (headerEnd < bufStr.size()) {
+          // Body was partially or fully read with headers
+          hello = bufStr.substr(headerEnd);
+        } else {
+          // Body needs to be read
+          int n = recv(s, buf, 4096, 0);
+          if (n > 0)
+            hello.assign(buf, n);
+        }
+
         std::string salt = JsonVal(hello, "salt"),
                     chal = JsonVal(hello, "challenge");
 
@@ -354,8 +384,8 @@ void NetThread() {
         id += "}}";
         SendWS(s, id);
 
-        isConn = true;
-        PostMessage(hMain, WM_OBS, 0, 0);
+        // Wait for OpCode 2 (Identified)
+        bool authenticated = false;
 
         DWORD lastPollRec = 0;
         DWORD lastPollStr = 0;
@@ -364,22 +394,25 @@ void NetThread() {
 
         while (true) {
           DWORD now = GetTickCount();
-          // Interleave polling to avoid packet merging/collision issues in
-          // simple parser
-          if (now - lastPollRec > 3000) {
-            SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetRecordStatus\","
-                      "\"requestId\":\"pollR\"}}");
-            lastPollRec = now;
-          }
-          if (now - lastPollStr > 3000 && now - lastPollRec > 1500) {
-            SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStreamStatus\","
-                      "\"requestId\":\"pollS\"}}");
-            lastPollStr = now;
-          }
-          if (now - lastPollStats > 2000) {
-            SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStats\","
-                      "\"requestId\":\"pollSt\"}}");
-            lastPollStats = now;
+
+          if (authenticated) {
+            // Interleave polling to avoid packet merging/collision issues in
+            // simple parser
+            if (now - lastPollRec > 3000) {
+              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetRecordStatus\","
+                        "\"requestId\":\"pollR\"}}");
+              lastPollRec = now;
+            }
+            if (now - lastPollStr > 3000 && now - lastPollRec > 1500) {
+              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStreamStatus\","
+                        "\"requestId\":\"pollS\"}}");
+              lastPollStr = now;
+            }
+            if (now - lastPollStats > 2000) {
+              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStats\","
+                        "\"requestId\":\"pollSt\"}}");
+              lastPollStats = now;
+            }
           }
 
           timeval tv = {0, 100000};
@@ -391,6 +424,17 @@ void NetThread() {
             if (r <= 0)
               break;
             std::string chunk(buf, r);
+
+            // Check for Identification Success (OpCode 2)
+            if (!authenticated && chunk.find("\"op\":2") != std::string::npos) {
+              authenticated = true;
+              isConn = true;
+              PostMessage(hMain, WM_OBS, 0, 0);
+              // Reset timers to poll immediately
+              lastPollRec = 0;
+              lastPollStr = 0;
+              lastPollStats = 0;
+            }
 
             // Check Recording Status
             if (chunk.find("RecordStateChanged") != -1 ||
@@ -473,7 +517,8 @@ void DrawUI(HDC hdc, int w, int h) {
   SelectObject(dc, bm);
   hits.clear();
 
-  FillRect(dc, &RECT{0, 0, w, h}, hBb);
+  RECT rBg = {0, 0, w, h};
+  FillRect(dc, &rBg, hBb);
   SetBkMode(dc, TRANSPARENT);
   SelectObject(dc, hF);
   SetTextColor(dc, COL_TEXT);
@@ -546,6 +591,17 @@ void DrawUI(HDC hdc, int w, int h) {
     Tick(52, C1 + 20, 340, "Warning Only", cfg.mode == MODE_WARN_ONLY);
 
     Tick(54, C2, 390, "Show encoder overload warnings", cfg.showOverloadWarn);
+
+    // Info text for overload warning (Always visible)
+    {
+      RECT rInfo = {S(C2 + 20), S(415), S(620), S(490)};
+      SetTextColor(dc, RGB(150, 150, 150)); // Dimmed text
+      DrawTextA(dc,
+                "Note: May show false positives caused by\nhigh CPU load "
+                "(e.g. on loading screens)",
+                -1, &rInfo, DT_LEFT | DT_TOP);
+      SetTextColor(dc, COL_TEXT); // Restore
+    }
 
     Btn(53, C2 + 20, 300, "Edit Processes", false);
 
@@ -979,7 +1035,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   RegisterClass(&wc);
 
   DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-  RECT wr = {0, 0, S(640), S(450)};
+  RECT wr = {0, 0, S(640), S(500)};
   AdjustWindowRect(&wr, style, FALSE);
 
   int scrW = GetSystemMetrics(SM_CXSCREEN);
