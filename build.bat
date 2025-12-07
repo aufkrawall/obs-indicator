@@ -7,58 +7,54 @@ set "EXE_NAME=OBSIndicator.exe"
 set "ICON_FILE=icon.ico"
 set "RC_FILE=resource.rc"
 set "RES_FILE=resource.res"
+set "ENV_DIR=%~dp0env\msys64"
+set "COMPILER=%ENV_DIR%\ucrt64\bin\clang++.exe"
 
-echo [1/5] Checking for Compiler Environment...
-
-:: Check if cl.exe is in PATH
-where cl.exe >nul 2>nul
-if %errorlevel% equ 0 goto :ENV_READY
-
-:: If not, try to locate VS
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
-    echo [ERROR] vswhere.exe not found.
-    echo         Please open this script in the "Developer Command Prompt for VS".
-    pause
-    exit /b
+echo [1/5] Checking for MSYS2 Environment...
+if not exist "%COMPILER%" (
+    echo [INFO] Compiler not found. Running setup script...
+    python setup_build_env.py
+    if !errorlevel! neq 0 (
+        echo [ERROR] Setup script failed.
+        pause
+        exit /b
+    )
 )
 
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-    set "VS_INSTALL_DIR=%%i"
-)
-
-if "%VS_INSTALL_DIR%"=="" (
-    echo [ERROR] No Visual Studio C++ found.
-    pause
-    exit /b
-)
-
-:: Initialize MSVC Environment
-call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\vcvarsall.bat" x64 >nul
-
-:ENV_READY
+:: Set PATH to include MSYS2 UCRT64 bin
+set "PATH=%ENV_DIR%\ucrt64\bin;%ENV_DIR%\usr\bin;%PATH%"
 
 echo [2/5] Checking for Icon...
 if not exist "%ICON_FILE%" (
-    echo [ERROR] %ICON_FILE% not found!
+    echo [ERROR] "%ICON_FILE%" not found!
     echo         Please run the python script 'generate_icon.py' first.
     pause
     exit /b
 )
 
 echo [3/5] Generating Resources...
-:: Create a resource script that links the icon to ID 101
 echo 101 ICON "%ICON_FILE%" > "%RC_FILE%"
-:: Compile resource script to .res
-rc.exe /nologo "%RC_FILE%"
+:: Use windres from MSYS2
+windres "%RC_FILE%" -O coff -o "%RES_FILE%"
+if !errorlevel! neq 0 (
+    echo [ERROR] Resource compilation failed.
+    pause
+    exit /b
+)
 
-echo [4/5] Compiling C++...
+echo [4/5] Compiling with Clang...
 if exist "%EXE_NAME%" del "%EXE_NAME%"
 
-:: Compile CPP and link with RES
-cl.exe /nologo /O2 /EHsc /DNDEBUG "%SOURCE_FILE%" "%RES_FILE%" /Fe:"%EXE_NAME%" /link /SUBSYSTEM:WINDOWS
+:: Compile with Clang (static linking for portability, optimized for size)
+:: Flags:
+:: -Os: Optimize for size
+:: -s: Strip symbols
+:: -ffunction-sections -fdata-sections: Place each function/data in own section
+:: -Wl,--gc-sections: Linker removes unused sections
+:: -fno-expires-entry -fno-rtti: Disable features we likely don't need (optional, but good for size)
+clang++ -std=c++17 -Os -DNDEBUG -mwindows -static -s -ffunction-sections -fdata-sections "%SOURCE_FILE%" "%RES_FILE%" -o "%EXE_NAME%" -lws2_32 -lgdi32 -luser32 -lshell32 -ldwmapi -ladvapi32 -lcrypt32 -luxtheme -Wl,--gc-sections
 
-if %errorlevel% neq 0 (
+if !errorlevel! neq 0 (
     echo [ERROR] Compilation Failed.
     pause
     exit /b
@@ -66,5 +62,5 @@ if %errorlevel% neq 0 (
 
 echo [5/5] Success! 
 echo.
-echo You can run %EXE_NAME% manually or with --tray
+echo You can run %EXE_NAME% manually.
 endlocal
