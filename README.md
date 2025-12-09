@@ -13,4 +13,4 @@ Program draws top-most window as efficiently as possible (presumably). Minimizes
 
 Now also has warning detection when obs recording/streaming IS NOT running in your game, e.g. as a reminder between different matches. You must add your game to process list for this, e.g. FortniteClient-Win64-Shipping.exe (is just running process detection and still 100% safe with anti-cheat, no inject of any kind).
 
-You need to enable WebSocket server in obs (Tools -> WebSocket Server Settings). Supports password authentication, saves password encrypted in config and should not unnecessarily keep unencrypted password in RAM. Might be AI generated.
+You need to enable WebSocket server in obs (Tools -> WebSocket Server Settings), the tool is retrieving obs status via that function. Supports password authentication, saves password encrypted in config and should not unnecessarily keep unencrypted password in RAM. Might be AI generated.
