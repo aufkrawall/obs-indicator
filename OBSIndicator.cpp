@@ -23,6 +23,7 @@
 #include <thread>
 #include <uxtheme.h>
 #include <vector>
+#include <functional>
 #include <wincrypt.h>
 #include <windows.h>
 #include <windowsx.h>
@@ -54,23 +55,26 @@ struct AppState {
   int size = 30;
   int pad = 20;
   int pos = 0; // 0=BR, 1=BL, 2=TR, 3=TL
-  bool circle = false;
   bool autoStart = false;
-  COLORREF col = RGB(255, 0, 0);
   int mode = MODE_INFO;
   std::string processList = ""; // Pipe delimited in memory/ini, newline in edit
   bool showOverloadWarn = false;
+  bool ghostMode = false;
 } cfg;
 
 struct {
   int x = -1, y = -1, s = -1;
   bool vis = false;
+  bool ghost = false;
 } lastOv;
+bool lastWarnVis = false; // Optimize warning window updates
 std::atomic<bool> isRec(false), isStream(false), isConn(false), isTest(false);
+std::atomic<bool> g_shutdown(false);  // Graceful shutdown flag
 std::atomic<DWORD> overloadWarnUntil(0);
 bool showLic = false;
 bool showProcList = false;
 float g_Scale = 1.0f;
+// Windows
 HWND hMain = NULL, hOv = NULL, hWarn = NULL;
 HWND hEditPad = NULL, hEditSize = NULL, hEditPass = NULL, hEditLic = NULL,
      hEditProcs = NULL;
@@ -227,7 +231,9 @@ std::string Auth(std::string &pass, const std::string &salt,
 std::string ManagePass(const char *newPass = nullptr) {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
-  strcpy(strrchr(path, '.'), ".ini");
+  char *dot = strrchr(path, '.');
+  if (!dot) return "";  // Safety check
+  strcpy(dot, ".ini");
 
   if (newPass) {
     std::string enc =
@@ -251,7 +257,9 @@ std::string ManagePass(const char *newPass = nullptr) {
 void IOCfg(bool save) {
   char path[MAX_PATH];
   GetModuleFileNameA(NULL, path, MAX_PATH);
-  strcpy(strrchr(path, '.'), ".ini");
+  char *dot = strrchr(path, '.');
+  if (!dot) return;  // Safety check
+  strcpy(dot, ".ini");
   if (save) {
     WritePrivateProfileStringA("S", "Sz", std::to_string(cfg.size).c_str(),
                                path);
@@ -259,23 +267,20 @@ void IOCfg(bool save) {
                                path);
     WritePrivateProfileStringA("S", "Ps", std::to_string(cfg.pos).c_str(),
                                path);
-    WritePrivateProfileStringA("S", "Cr", cfg.circle ? "1" : "0", path);
     WritePrivateProfileStringA("S", "Au", cfg.autoStart ? "1" : "0", path);
-    WritePrivateProfileStringA("S", "Cl", std::to_string(cfg.col).c_str(),
-                               path);
     WritePrivateProfileStringA("S", "Md", std::to_string(cfg.mode).c_str(),
                                path);
     WritePrivateProfileStringA("S", "Ow", cfg.showOverloadWarn ? "1" : "0",
                                path);
+    WritePrivateProfileStringA("S", "Gm", cfg.ghostMode ? "1" : "0", path);
     WritePrivateProfileStringA("S", "Pr", cfg.processList.c_str(), path);
   } else {
     cfg.size = GetPrivateProfileIntA("S", "Sz", 30, path);
     cfg.pad = GetPrivateProfileIntA("S", "Pd", 20, path);
     cfg.pos = GetPrivateProfileIntA("S", "Ps", 0, path);
-    cfg.circle = GetPrivateProfileIntA("S", "Cr", 0, path) == 1;
     cfg.autoStart = GetPrivateProfileIntA("S", "Au", 0, path) == 1;
     cfg.showOverloadWarn = GetPrivateProfileIntA("S", "Ow", 0, path) == 1;
-    cfg.col = GetPrivateProfileIntA("S", "Cl", RGB(255, 0, 0), path);
+    cfg.ghostMode = GetPrivateProfileIntA("S", "Gm", 0, path) == 1;
     cfg.mode = GetPrivateProfileIntA("S", "Md", 0, path);
     char buf[4096] = {0};
     GetPrivateProfileStringA("S", "Pr", "", buf, 4096, path);
@@ -287,7 +292,7 @@ void IOCfg(bool save) {
 std::string JsonVal(const std::string &json, const std::string &key) {
   std::string q = "\"" + key + "\"";
   size_t p = json.find(q);
-  if (p == -1)
+  if (p == std::string::npos)
     return "";
   p = json.find(":", p) + 1;
   while (p < json.size() && (isspace(json[p]) || json[p] == '"'))
@@ -317,10 +322,13 @@ void SendWS(SOCKET s, const std::string &txt) {
 }
 
 void NetThread() {
-  while (true) {
+  WSADATA w;
+  WSAStartup(MAKEWORD(2, 2), &w);  // Initialize once at thread start
+  
+  while (!g_shutdown) {
     Sleep(1000);
-    WSADATA w;
-    WSAStartup(MAKEWORD(2, 2), &w);
+    if (g_shutdown) break;
+    
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     sockaddr_in a = {AF_INET, htons(4455)};
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
@@ -437,9 +445,9 @@ void NetThread() {
             }
 
             // Check Recording Status
-            if (chunk.find("RecordStateChanged") != -1 ||
-                chunk.find("GetRecordStatus") != -1) {
-              bool act = chunk.find("\"outputActive\":true") != -1;
+            if (chunk.find("RecordStateChanged") != std::string::npos ||
+                chunk.find("GetRecordStatus") != std::string::npos) {
+              bool act = chunk.find("\"outputActive\":true") != std::string::npos;
               if (act != isRec) {
                 isRec = act;
                 PostMessage(hMain, WM_OBS, 0, 0);
@@ -447,9 +455,9 @@ void NetThread() {
             }
 
             // Check Streaming Status
-            if (chunk.find("StreamStateChanged") != -1 ||
-                chunk.find("GetStreamStatus") != -1) {
-              bool act = chunk.find("\"outputActive\":true") != -1;
+            if (chunk.find("StreamStateChanged") != std::string::npos ||
+                chunk.find("GetStreamStatus") != std::string::npos) {
+              bool act = chunk.find("\"outputActive\":true") != std::string::npos;
               if (act != isStream) {
                 isStream = act;
                 PostMessage(hMain, WM_OBS, 0, 0);
@@ -457,7 +465,7 @@ void NetThread() {
             }
 
             // Check Stats (Encoder Overload)
-            if (chunk.find("GetStats") != -1) {
+            if (chunk.find("GetStats") != std::string::npos) {
               std::string skipS = JsonVal(chunk, "outputSkippedFrames");
               if (!skipS.empty()) {
                 int skip = atoi(skipS.c_str());
@@ -477,7 +485,6 @@ void NetThread() {
       }
     }
     closesocket(s);
-    WSACleanup();
     if (isConn) {
       isConn = false;
       isRec = false;
@@ -485,12 +492,21 @@ void NetThread() {
       PostMessage(hMain, WM_OBS, 0, 0);
     }
     overloadWarnUntil = 0;
-    Sleep(1000);
+    if (!g_shutdown) Sleep(1000);
   }
+  
+  WSACleanup();  // Cleanup once at thread end
 }
 
 // --- UI ---
 HFONT hF, hFb;
+// Cached Warning Resources
+HFONT g_hFontWarn = NULL;
+HBITMAP g_hBmWarn = NULL;
+HDC g_hdcWarn = NULL;
+SIZE g_sizeWarn = {0, 0};
+std::string g_lastWarnMsg = "";
+
 HBRUSH hBb, hBp, hBr, hBbtn, hBa, hBi;
 struct Hit {
   int id;
@@ -509,6 +525,13 @@ void InitGDI() {
   hBbtn = CreateSolidBrush(COL_BTN_FACE);
   hBa = CreateSolidBrush(COL_ACCENT);
   hBi = CreateSolidBrush(COL_INPUT_BG);
+
+  // Initialize Cached Warning Resources
+  g_hFontWarn = CreateFontA(-S(40), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                            0, 0, 0, 0, "Arial");
+  HDC hdcScreen = GetDC(NULL);
+  g_hdcWarn = CreateCompatibleDC(hdcScreen);
+  ReleaseDC(NULL, hdcScreen);
 }
 
 void DrawUI(HDC hdc, int w, int h) {
@@ -556,7 +579,9 @@ void DrawUI(HDC hdc, int w, int h) {
         FillRect(dc, &i, hBa);
       }
       TextOutA(dc, S(x + 30), S(y), t, strlen(t));
-      hits.push_back({id, {S(x), S(y), S(x + 300), S(y + 20)}});
+      // Dynamic Hit Width calculation to avoid overlap
+      int estW = S(30 + (int)(strlen(t) * 10)); // 30px checkbox + ~10px per char
+      hits.push_back({id, {S(x), S(y), S(x) + estW, S(y + 20)}});
     };
     auto Btn = [&](int id, int x, int y, const char *t, bool active = false) {
       RECT r = {S(x), S(y), S(x + 120), S(y + 35)};
@@ -565,7 +590,7 @@ void DrawUI(HDC hdc, int w, int h) {
       hits.push_back({id, r});
     };
 
-    int C1 = 20, C2 = 240, C3 = 450;
+    int C1 = 20, C2 = 260, C3 = 450;
 
     Grp(C1, 30, 180, 200, "Corner Position");
     Tick(10, C1 + 20, 50, "Top Left", cfg.pos == 3);
@@ -573,43 +598,51 @@ void DrawUI(HDC hdc, int w, int h) {
     Tick(12, C1 + 20, 130, "Bottom Left", cfg.pos == 1);
     Tick(13, C1 + 20, 170, "Bottom Right", cfg.pos == 0);
 
-    TextOutA(dc, S(C2), S(30), "Padding:", 8);
-    TextOutA(dc, S(C2), S(70), "Size:", 5);
+    // Move Padding/Size labels slightly right (C2 + 20)
+    TextOutA(dc, S(C2 + 20), S(30), "Padding:", 8);
+    TextOutA(dc, S(C2 + 20), S(70), "Size:", 5);
 
-    Grp(C2, 110, 160, 100, "Shape");
-    Tick(20, C2 + 20, 130, "Square", !cfg.circle);
-    Tick(21, C2 + 20, 170, "Circle", cfg.circle);
-
-    Grp(C3, 30, 140, 140, "Color");
-    Tick(30, C3 + 20, 50, "Red", cfg.col == RGB(255, 0, 0));
-    Tick(31, C3 + 20, 90, "Green", cfg.col == RGB(0, 255, 0));
-    Tick(32, C3 + 20, 130, "Blue", cfg.col == RGB(0, 0, 255));
-
-    Grp(C1, 260, 400, 120, "Mode");
-    Tick(50, C1 + 20, 280, "Information Indicator", cfg.mode == MODE_INFO);
-    Tick(51, C1 + 20, 310, "Warning Indicator", cfg.mode == MODE_WARN);
-    Tick(52, C1 + 20, 340, "Warning Only", cfg.mode == MODE_WARN_ONLY);
-
-    Tick(54, C2, 390, "Show encoder overload warnings", cfg.showOverloadWarn);
-
-    // Info text for overload warning (Always visible)
+    // Group Padding, Size, Ghost Mode, Overload (Wider and Taller to fit note)
+    Grp(C2, 10, 360, 270, "Appearance"); // H=270, Bottom=280
+    
+    // Ghost Mode (Always Render)
+    Tick(55, C2 + 20, 130, "Always Render (Invisible when idle)", cfg.ghostMode);
+    
+    // Show encoder overload warnings
+    Tick(54, C2 + 20, 170, "Show encoder overload warnings", cfg.showOverloadWarn);
+    
+    // Info text for overload warning
     {
-      RECT rInfo = {S(C2 + 20), S(415), S(620), S(490)};
-      SetTextColor(dc, RGB(150, 150, 150)); // Dimmed text
+      // Checkbox is at 170. Note at 200.
+      RECT rInfo = {S(C2 + 40), S(200), S(C2 + 350), S(270)}; // Increased H to avoid truncation
+      SetTextColor(dc, RGB(150, 150, 150));
       DrawTextA(dc,
                 "Note: May show false positives caused by\nhigh CPU load "
                 "(e.g. on loading screens)",
                 -1, &rInfo, DT_LEFT | DT_TOP);
-      SetTextColor(dc, COL_TEXT); // Restore
+      SetTextColor(dc, COL_TEXT);
     }
 
-    Btn(53, C2 + 20, 300, "Edit Processes", false);
+    // Draw Mode Group (Narrowed to fit in Col 1)
+    Grp(C1, 260, 220, 120, "Mode");
+    Tick(50, C1 + 20, 280, "Information Indicator", cfg.mode == MODE_INFO);
+    Tick(51, C1 + 20, 310, "Warning Indicator", cfg.mode == MODE_WARN);
+    Tick(52, C1 + 20, 340, "Warning Only", cfg.mode == MODE_WARN_ONLY);
 
-    Btn(41, C3, 220, isTest ? "Stop Test" : "Test Overlay", isTest);
-    Tick(40, C3, 280, "Launch on Startup", cfg.autoStart);
-    Btn(42, C3, 320, "View License", false);
+    // Controls Below Appearance Group (Y > 280)
+    
+    // WebSocket Password (Label at 290)
+    TextOutA(dc, S(C2), S(290), "WebSocket Password:", 19);
 
-    TextOutA(dc, S(C2), S(220) + S(8), "WebSocket Password:", 19);
+    // Buttons
+    // Test Overlay (Align with Password Edit at Y=312)
+    Btn(41, C3, 312, isTest ? "Stop Test" : "Test Overlay", isTest);
+    
+    // Edit Processes (Below Password)
+    Btn(53, C2, 350, "Edit Processes", false);
+    
+    Tick(40, C3, 355, "Launch on Startup", cfg.autoStart);
+    Btn(42, C3, 395, "View License", false);
 
     // Status Line
     char st[100];
@@ -634,7 +667,7 @@ void DrawUI(HDC hdc, int w, int h) {
     }
 
     SetTextColor(dc, stCol);
-    TextOutA(dc, S(C1), S(420), st, strlen(st));
+    TextOutA(dc, S(C1), S(440), st, strlen(st));
   }
 
   BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
@@ -642,135 +675,278 @@ void DrawUI(HDC hdc, int w, int h) {
   DeleteDC(dc);
 }
 
+// --- RENDERING HELPER ---
+void UpdateLayered(HWND hWnd, int x, int y, int w, int h, BYTE alpha,
+                   std::function<void(HDC)> drawFn) {
+  HDC hdcScreen = GetDC(NULL);
+  HDC hdcMem = CreateCompatibleDC(hdcScreen);
+  
+  // NOTE: CreateCompatibleBitmap with a DC that might be screen.
+  // We need to ensure we have a valid bitmap.
+  HBITMAP hBm = CreateCompatibleBitmap(hdcScreen, w, h);
+  HBITMAP hOldBm = (HBITMAP)SelectObject(hdcMem, hBm);
+
+  drawFn(hdcMem);
+
+  POINT ptDst = {x, y};
+  SIZE size = {w, h};
+  POINT ptSrc = {0, 0};
+  
+  // Fix: If alpha is 255, we can drop ULW_ALPHA to rely purely on ColorKey if desired,
+  // but using both is valid.
+  // Ensure alpha is strictly BYTE.
+  BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, 0};
+  
+  // Always use both flags for consistent behavior
+  DWORD flags = ULW_COLORKEY | ULW_ALPHA;
+
+  // Use Black as Color Key
+  UpdateLayeredWindow(hWnd, hdcScreen, &ptDst, &size, hdcMem, &ptSrc,
+                      RGB(0, 0, 0), &blend, flags);
+
+  SelectObject(hdcMem, hOldBm);
+  DeleteObject(hBm);
+  DeleteDC(hdcMem);
+  ReleaseDC(NULL, hdcScreen);
+}
+
+// --- UPDATED UpdateOv logic for Padded Window strategy ---
 void UpdateOv() {
-  // Normal Indicator
   int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN),
       p = cfg.pad, s = cfg.size;
-  int x[] = {sw - s - p, p, sw - s - p, p},
-      y[] = {sh - s - p, sh - s - p, p, p};
-  int cx = x[cfg.pos], cy = y[cfg.pos];
+  
+  // Full Size of the window (Size + Padding) to touch the corner
+  int fullS = s + p;
+  
+  // Window Positions (Anchored to Screen Corners)
+  // Correct Map: 0=BR, 1=BL, 2=TR, 3=TL
+  int winX = 0, winY = 0;
+  if (cfg.pos == 3) { winX = 0; winY = 0; } // TL
+  else if (cfg.pos == 2) { winX = sw - fullS; winY = 0; } // TR
+  else if (cfg.pos == 1) { winX = 0; winY = sh - fullS; } // BL
+  else { winX = sw - fullS; winY = sh - fullS; } // BR
+  
+  // Indicator Offsets (Relative to Window)
+  int indX = 0, indY = 0;
+  if (cfg.pos == 3) { indX = p; indY = p; } // TL
+  else if (cfg.pos == 2) { indX = 0; indY = p; } // TR
+  else if (cfg.pos == 1) { indX = p; indY = 0; } // BL
+  else { indX = 0; indY = 0; } // BR
+  
+  // Ghost Pixel Offsets (Relative to Window - Furthest Corner)
+  int pixX = 0, pixY = 0;
+  if (cfg.pos == 3) { pixX = 0; pixY = 0; } // TL -> 0,0 (Screen Corner)
+  else if (cfg.pos == 2) { pixX = fullS - 1; pixY = 0; } // TR -> WinW-1, 0
+  else if (cfg.pos == 1) { pixX = 0; pixY = fullS - 1; } // BL -> 0, WinH-1
+  else { pixX = fullS - 1; pixY = fullS - 1; } // BR -> WinW-1, WinH-1
 
   // Logic for Info Indicator Visibility
   bool active = isRec || isStream;
-
   bool showInd = false;
   if (isTest)
     showInd = true;
-  else if (active) {
-    if (cfg.mode != MODE_WARN_ONLY)
-      showInd = true;
-  }
+  else if (active && cfg.mode != MODE_WARN_ONLY)
+    showInd = true;
 
-  if (showInd != lastOv.vis ||
-      (showInd && (cx != lastOv.x || cy != lastOv.y || s != lastOv.s))) {
-    SetWindowPos(hOv, HWND_TOPMOST, cx, cy, s, s,
-                 SWP_NOACTIVATE | (showInd ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-    if (showInd)
-      InvalidateRect(hOv, NULL, TRUE);
-    lastOv = {cx, cy, s, showInd};
+  // Determine Alpha
+  BYTE indAlpha = 0;
+  bool doUpdateInd = false;
+
+  if (cfg.ghostMode) {
+    indAlpha = showInd ? 255 : 1;
+    // Update if Alpha changed, GhostMode toggled, OR Geometry changed
+    // Note: We track winX/winY/fullS in lastOv now effectively?
+    // Using s, p, pos to track geom changes.
+    // Let's use generic check.
+    if (indAlpha != (lastOv.vis ? 255 : 1) || cfg.ghostMode != lastOv.ghost ||
+        lastOv.x != winX || lastOv.y != winY || lastOv.s != fullS) {
+        doUpdateInd = true;
+    }
+  } else {
+    // Classic Mode
+    if (showInd) {
+        indAlpha = 255;
+        if (!lastOv.vis || lastOv.x != winX || lastOv.y != winY || lastOv.s != fullS || lastOv.ghost)
+            doUpdateInd = true;
+    } else {
+        if (lastOv.vis || lastOv.ghost) {
+            indAlpha = 0;
+            doUpdateInd = true;
+        }
+    }
+  }
+  
+  if (doUpdateInd) {
+    if (indAlpha > 0) {
+         if (!IsWindowVisible(hOv)) ShowWindow(hOv, SW_SHOWNA);
+         // Move to PADDED position
+         SetWindowPos(hOv, HWND_TOPMOST, winX, winY, fullS, fullS, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+         if (!cfg.ghostMode) 
+             SetWindowPos(hOv, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    }
+    
+    UpdateLayered(hOv, winX, winY, fullS, fullS, indAlpha, [&](HDC dc) {
+      if (indAlpha == 1) {
+          // Draw 1x1 Pixel at Calculated Offset
+          HBRUSH hInv = CreateSolidBrush(RGB(0, 0, 1));
+          RECT rPixel = {pixX, pixY, pixX + 1, pixY + 1};
+          FillRect(dc, &rPixel, hInv);
+          DeleteObject(hInv);
+          return;
+      }
+      
+      // Fill Black (Key)
+      HBRUSH hBlack = CreateSolidBrush(RGB(0, 0, 0));
+      RECT r = {0, 0, fullS, fullS};
+      FillRect(dc, &r, hBlack);
+      DeleteObject(hBlack);
+
+      // Draw Red Circle / White Border at Indicator Offset
+      HPEN hPen = CreatePen(PS_SOLID, S(2), RGB(255, 255, 255));
+      HBRUSH hBrush = CreateSolidBrush(RGB(255, 0, 0));
+      HPEN hOldPen = (HPEN)SelectObject(dc, hPen);
+      HBRUSH hOldBrush = (HBRUSH)SelectObject(dc, hBrush);
+      // Circle Rect: indX, indY, indX+s, indY+s
+      // Adjust for Pen (S(1) offset inside the circle rect?)
+      // Original: Ellipse(dc, S(1), S(1), s - S(1), s - S(1)); 
+      // We need to shift this by indX, indY
+      Ellipse(dc, indX + S(1), indY + S(1), indX + s - S(1), indY + s - S(1));
+      
+      SelectObject(dc, hOldPen);
+      SelectObject(dc, hOldBrush);
+      DeleteObject(hBrush);
+      DeleteObject(hPen);
+    });
+    
+    lastOv = {winX, winY, fullS, showInd, cfg.ghostMode};
   }
 
   // Warning Overlay Update
-  bool showOverload =
-      cfg.showOverloadWarn && (GetTickCount() < overloadWarnUntil);
-  if (warnVisible || showOverload) {
-    SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, sw, sh,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    // Force repaint to handle dynamic text positioning updates
-    InvalidateRect(hWarn, NULL, TRUE);
+  bool showOverload = cfg.showOverloadWarn && (GetTickCount() < overloadWarnUntil);
+  bool showW = warnVisible || showOverload;
+  BYTE warnAlpha = 0;
+  bool doUpdateWarn = false;
+  
+  const char *msg = "OBS INACTIVE";
+  if (cfg.showOverloadWarn && GetTickCount() < overloadWarnUntil)
+      msg = "Encoder overloaded!";
+
+  // We need to calculate position and size every time because text might change or pos might change
+  // But we can cache the last text/state to avoid ULW calls.
+  static std::string lastMsg = "";
+
+  if (cfg.ghostMode) {
+      // In ghost mode: warning window uses alpha=0 when hidden (100% invisible)
+      // Only the indicator overlay's 1x1 pixel uses alpha=1 for MPO prevention
+      warnAlpha = showW ? 255 : 0;
+      if ((warnAlpha > 0) != lastWarnVis || cfg.ghostMode != lastOv.ghost || msg != lastMsg)
+          doUpdateWarn = true;
   } else {
-    SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOACTIVATE | SWP_HIDEWINDOW);
+      if (showW) {
+          warnAlpha = 255;
+          if (!lastWarnVis || msg != lastMsg || lastOv.ghost)
+              doUpdateWarn = true;
+      } else {
+          if (lastWarnVis || lastOv.ghost) {
+            warnAlpha = 0;
+            doUpdateWarn = true;
+          }
+      }
+  }
+
+  if (doUpdateWarn) {
+    if (warnAlpha > 0) {
+        if (!IsWindowVisible(hWarn)) ShowWindow(hWarn, SW_SHOWNA);
+        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    } else {
+        // Hide warning window when not visible (even in ghost mode)
+        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+    }
+
+    // Check Cache Validity
+    bool cacheStale = (msg != g_lastWarnMsg) || (g_hBmWarn == NULL);
+    
+    // Position/Size must be recalculated if message changes OR scale changes (which we don't handle dynamic DPI yet fully, but assuming S stays same)
+    // Actually, position depends on screen size too. We calculate Pos every frame anyway.
+
+    if (cacheStale) {
+        // 1. Calculate Size
+        HDC hdcScreen = GetDC(NULL);
+        // Use temp DC for measurment
+        HDC dc = CreateCompatibleDC(hdcScreen);
+        SelectObject(dc, g_hFontWarn); // Use cached font
+        RECT rText = {0, 0, 0, 0};
+        DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
+        int wW = rText.right - rText.left + S(20);
+        int wH = rText.bottom - rText.top + S(10);
+        DeleteDC(dc);
+        
+        // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
+        if (g_hBmWarn) DeleteObject(g_hBmWarn);
+        g_hBmWarn = CreateCompatibleBitmap(hdcScreen, wW, wH);
+        
+        // 3. Draw into Cached Bitmap
+        SelectObject(g_hdcWarn, g_hBmWarn);
+        SelectObject(g_hdcWarn, g_hFontWarn);
+        SetTextColor(g_hdcWarn, COL_WARN_TEXT);
+        SetBkMode(g_hdcWarn, TRANSPARENT);
+        
+        // Fill Black (Key)
+        RECT rFill = {0, 0, wW, wH};
+        HBRUSH hK = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(g_hdcWarn, &rFill, hK);
+        DeleteObject(hK);
+        
+        RECT rT = {S(10), S(5), wW, wH};
+        DrawTextA(g_hdcWarn, msg, -1, &rT, DT_LEFT | DT_TOP | DT_NOCLIP);
+        
+        ReleaseDC(NULL, hdcScreen);
+        
+        g_sizeWarn = {wW, wH};
+        g_lastWarnMsg = msg;
+    }
+    
+    // Calculate Position based on Corner (always dynamic)
+    int wx = 0, wy = 0;
+    int off = s + p + S(10);
+    int wW = g_sizeWarn.cx;
+    int wH = g_sizeWarn.cy;
+
+    if (cfg.pos == 3) { // Top Left
+        wx = off; wy = p;
+    } else if (cfg.pos == 2) { // Top Right
+        wx = sw - off - wW; wy = p;
+    } else if (cfg.pos == 1) { // Bottom Left
+        wx = off; wy = sh - p - wH; // approx
+    } else { // Bottom Right
+        wx = sw - off - wW; wy = sh - p - wH - S(40);
+    }
+    
+    // UpdateLayeredWindow using CACHED DC/Bitmap
+    POINT ptDst = {wx, wy};
+    SIZE size = {wW, wH};
+    POINT ptSrc = {0, 0};
+    
+    // Always use both flags for consistent behavior
+    DWORD flags = ULW_COLORKEY | ULW_ALPHA;
+
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, warnAlpha, 0};
+    UpdateLayeredWindow(hWarn, NULL, &ptDst, &size, g_hdcWarn, &ptSrc, RGB(0,0,0), &blend, flags);
+
+    lastWarnVis = warnAlpha > 0;
   }
 }
 
+
 LRESULT CALLBACK P(HWND h, UINT m, WPARAM w, LPARAM l) {
-  if (m == WM_PAINT) {
-    PAINTSTRUCT ps;
-    HDC dc = BeginPaint(h, &ps);
-    RECT rc;
-    GetClientRect(h, &rc);
-    HBRUSH hBlack = CreateSolidBrush(RGB(0, 0, 0));
-    FillRect(dc, &rc, hBlack);
-    DeleteObject(hBlack);
-    HBRUSH b = CreateSolidBrush(cfg.col);
-    SelectObject(dc, b);
-    SelectObject(dc, GetStockObject(NULL_PEN));
-    cfg.circle ? Ellipse(dc, 0, 0, cfg.size, cfg.size)
-               : Rectangle(dc, 0, 0, cfg.size, cfg.size);
-    DeleteObject(b);
-    EndPaint(h, &ps);
-    return 0;
-  }
+  // WM_PAINT handled by UpdateLayeredWindow
   return DefWindowProc(h, m, w, l);
 }
 
 // Warning Window Proc
 LRESULT CALLBACK W(HWND h, UINT m, WPARAM w, LPARAM l) {
-  if (m == WM_PAINT) {
-    PAINTSTRUCT ps;
-    HDC dc = BeginPaint(h, &ps);
-    RECT rc;
-    GetClientRect(h, &rc);
-    // Fill with black key color
-    HBRUSH hK = CreateSolidBrush(RGB(1, 1, 1));
-    FillRect(dc, &rc, hK);
-    DeleteObject(hK);
-
-    // Smaller font for corner warning (-S(40) instead of -S(80))
-    HFONT hFontBig = CreateFontA(-S(40), 0, 0, 0, FW_BOLD, 0, 0, 0,
-                                 DEFAULT_CHARSET, 0, 0, 0, 0, "Arial");
-    SelectObject(dc, hFontBig);
-    SetTextColor(dc, COL_WARN_TEXT);
-    SetBkMode(dc, TRANSPARENT);
-
-    SelectObject(dc, hFontBig);
-    SetTextColor(dc, COL_WARN_TEXT);
-    SetBkMode(dc, TRANSPARENT);
-
-    const char *msg = "OBS INACTIVE"; // Changed text to cover both Rec & Stream
-    if (cfg.showOverloadWarn && GetTickCount() < overloadWarnUntil)
-      msg = "Encoder overloaded!";
-
-    // Calculate text position based on cfg.pos (same corners as indicator)
-    // Indicator Posiitons: 0=BR, 1=BL, 2=TR, 3=TL
-    // Text needs to be near the corner but not overlapping the indicator
-    // (approx size+pad)
-
-    int p = cfg.pad;
-    int s = cfg.size;
-    int off = p + s + S(10); // Offset to clear the indicator
-
-    RECT rT = rc; // Start with full screen rect
-    UINT format = 0;
-
-    if (cfg.pos == 3) { // Top Left
-      rT.left = off;
-      rT.top = p;
-      format = DT_LEFT | DT_TOP;
-    } else if (cfg.pos == 2) { // Top Right
-      rT.right = rc.right - off;
-      rT.top = p;
-      format = DT_RIGHT | DT_TOP;
-    } else if (cfg.pos == 1) { // Bottom Left
-      rT.left = off;
-      rT.bottom = rc.bottom - p;
-      // DrawText doesn't support DT_BOTTOM easily for single line without calc,
-      // so we position top manually for bottom
-      rT.top = rc.bottom - p - S(40); // Approx height
-      format = DT_LEFT | DT_TOP;
-    } else { // Bottom Right
-      rT.right = rc.right - off;
-      rT.top = rc.bottom - p - S(40);
-      format = DT_RIGHT | DT_TOP;
-    }
-
-    DrawTextA(dc, msg, -1, &rT, format | DT_NOCLIP);
-
-    DeleteObject(hFontBig);
-    EndPaint(h, &ps);
-    return 0;
-  }
+  // WM_PAINT handled by UpdateLayeredWindow
   return DefWindowProc(h, m, w, l);
 }
 
@@ -836,10 +1012,12 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     } else {
       ShowWindow(hEditLic, SW_HIDE);
       ShowWindow(hEditProcs, SW_HIDE);
-      int C2 = S(240);
-      MoveWindow(hEditPad, C2 + S(80), S(28), S(60), S(24), 1);
-      MoveWindow(hEditSize, C2 + S(80), S(68), S(60), S(24), 1);
-      MoveWindow(hEditPass, C2, S(220) + S(30), S(160), S(24), 1);
+      int C2 = S(260); // Shifted from 240
+      // Move Edit Boxes to new positions
+      MoveWindow(hEditPad, C2 + S(100), S(28), S(60), S(24), 1);
+      MoveWindow(hEditSize, C2 + S(100), S(68), S(60), S(24), 1);
+      // Password Edit: Y=312 (Below 290 Label)
+      MoveWindow(hEditPass, C2, S(312), S(160), S(24), 1);
       ShowWindow(hEditPad, 1);
       ShowWindow(hEditSize, 1);
       ShowWindow(hEditPass, 1);
@@ -874,14 +1052,7 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           cfg.pos = 1;
         if (hit.id == 13)
           cfg.pos = 0;
-        if (hit.id == 20)
-          cfg.circle = 0;
-        if (hit.id == 21)
-          cfg.circle = 1;
-        if (hit.id >= 30 && hit.id <= 32) {
-          COLORREF c[] = {RGB(255, 0, 0), RGB(0, 255, 0), RGB(0, 0, 255)};
-          cfg.col = c[hit.id - 30];
-        }
+        // Removed Shape(20,21) and Color(30-32) handlers
         if (hit.id == 40) {
           cfg.autoStart = !cfg.autoStart;
           HKEY k;
@@ -920,6 +1091,8 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           showProcList = 1;
         if (hit.id == 54)
           cfg.showOverloadWarn = !cfg.showOverloadWarn;
+        if (hit.id == 55)
+          cfg.ghostMode = !cfg.ghostMode;
 
         IOCfg(true);
         UpdateOv();
@@ -992,6 +1165,25 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
   } else if (m == WM_TRAY && l == WM_LBUTTONUP) {
     ShowWindow(h, SW_RESTORE);
     SetForegroundWindow(h);
+  } else if (m == WM_GETMINMAXINFO) {
+    MINMAXINFO *mmi = (MINMAXINFO *)l;
+    // Lock Size to current or initial
+    // We want fixed client size 640x480 (scaled)
+    // We'll calculate the window rect for that and enforcing it.
+    // Or simpler: lock to the size set in WinMain.
+    // However, M doesn't know WinMain vars readily. 
+    // We can just recalculate quickly or use static.
+    static POINT sz = {0, 0};
+    if (sz.x == 0) {
+       DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
+       RECT wr = {0, 0, S(640), S(480)};
+       AdjustWindowRect(&wr, style, FALSE);
+       sz.x = wr.right - wr.left;
+       sz.y = wr.bottom - wr.top;
+    }
+    mmi->ptMinTrackSize = sz;
+    mmi->ptMaxTrackSize = sz;
+    return 0;
   } else if (m == WM_CLOSE)
     PostQuitMessage(0);
   return DefWindowProc(h, m, w, l);
@@ -1013,7 +1205,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   hOv = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT |
                            WS_EX_TOOLWINDOW,
                        "O", "", WS_POPUP, 0, 0, 0, 0, 0, 0, hI, 0);
-  SetLayeredWindowAttributes(hOv, 0, 0, LWA_COLORKEY);
+  // Do NOT set LWA logic here if we use UpdateLayeredWindow immediately or consistently.
+  // But ULW overrides it anyway.
+
 
   // Warning Window Class
   WNDCLASS wcw = {0};
@@ -1024,8 +1218,6 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   hWarn = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT |
                              WS_EX_TOOLWINDOW,
                          "WARN", "", WS_POPUP, 0, 0, 0, 0, 0, 0, hI, 0);
-  // Use RGB(1,1,1) as key for warning window transparency
-  SetLayeredWindowAttributes(hWarn, RGB(1, 1, 1), 0, LWA_COLORKEY);
 
   wc.lpfnWndProc = M;
   wc.lpszClassName = "C";
@@ -1034,8 +1226,9 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   wc.hCursor = LoadCursor(0, IDC_ARROW);
   RegisterClass(&wc);
 
-  DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-  RECT wr = {0, 0, S(640), S(500)};
+  DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
+  // Increased Window Height to 480
+  RECT wr = {0, 0, S(640), S(480)};
   AdjustWindowRect(&wr, style, FALSE);
 
   int scrW = GetSystemMetrics(SM_CXSCREEN);
