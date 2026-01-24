@@ -4,6 +4,7 @@ import subprocess
 import urllib.request
 import zipfile
 import shutil
+import json
 from pathlib import Path
 
 # --- CONFIGURATION ---
@@ -59,6 +60,50 @@ def ensure_zig():
 def check_requirements():
     if not Path(ICON_FILE).exists():
         fail(f"'{ICON_FILE}' not found! Please run 'python generate_icon.py' first.")
+
+def generate_compile_commands(zig_exe_path):
+    # Create compile_commands.json for LSP support
+    # We use clang++ as the command to ensure standard clangd picks it up,
+    # but we add explicit -isystem paths to Zig's bundled headers.
+    
+    # Use relative paths to avoid absolute paths/usernames in the generated file
+    # Paths are relative to the workspace root (where compile_commands.json resides)
+    zig_lib = Path("tools") / "zig" / "lib"
+    
+    includes = [
+        zig_lib / "libcxx" / "include",
+        zig_lib / "libcxxabi" / "include",
+        zig_lib / "libunwind" / "include",
+        zig_lib / "include",
+        zig_lib / "libc" / "include" / "any-windows-any"
+    ]
+    
+    include_flags = " ".join([f'-isystem "{p}"'.replace("\\", "/") for p in includes])
+    
+    # Note: We use clang++ here because clangd recognizes it better than zig.exe
+    cmd_str = (
+        'clang++ '
+        "--driver-mode=g++ "
+        "-target x86_64-windows-gnu "
+        "-std=c++17 "
+        "-Os "
+        "-DNDEBUG "
+        f"{include_flags} "
+        f"-c {SOURCE_FILE}"
+    )
+    
+    data = [
+        {
+            "directory": ".",
+            "command": cmd_str,
+            "file": SOURCE_FILE
+        }
+    ]
+    
+    with open("compile_commands.json", "w") as f:
+        json.dump(data, f, indent=2)
+    
+    log("Generated compile_commands.json")
 
 def build():
     # 1. Generate Resource File
@@ -131,6 +176,9 @@ def build():
         fail("Compilation failed.")
         
     log(f"Success! Created {EXE_NAME}")
+    
+    # Generate LSP file
+    generate_compile_commands(ZIG_EXE)
 
 def main():
     check_requirements()
