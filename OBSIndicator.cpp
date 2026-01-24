@@ -29,12 +29,14 @@
 #include <windowsx.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <tlhelp32.h>
 
 // --- CONSTANTS ---
 #define WM_TRAY (WM_USER + 1)
 #define WM_OBS (WM_USER + 2)
-#define IDI_MAIN_ICON 101
 #define TIMER_WARN 999
+#define TIMER_SAVE 998 // Timer for delayed saving
+#define IDI_MAIN_ICON 101
 
 // Palette
 #define COL_BG RGB(20, 20, 20)
@@ -60,6 +62,8 @@ struct AppState {
   std::string processList = ""; // Pipe delimited in memory/ini, newline in edit
   bool showOverloadWarn = false;
   bool ghostMode = false;
+  bool ghostModeOnlyWhenGame = false;
+  bool boostObsPriority = false;
 } cfg;
 
 struct {
@@ -71,6 +75,7 @@ bool lastWarnVis = false; // Optimize warning window updates
 std::atomic<bool> isRec(false), isStream(false), isConn(false), isTest(false);
 std::atomic<bool> g_shutdown(false);  // Graceful shutdown flag
 std::atomic<DWORD> overloadWarnUntil(0);
+std::atomic<DWORD> configDirtyTime(0); // For debounced saving
 bool showLic = false;
 bool showProcList = false;
 float g_Scale = 1.0f;
@@ -273,6 +278,8 @@ void IOCfg(bool save) {
     WritePrivateProfileStringA("S", "Ow", cfg.showOverloadWarn ? "1" : "0",
                                path);
     WritePrivateProfileStringA("S", "Gm", cfg.ghostMode ? "1" : "0", path);
+    WritePrivateProfileStringA("S", "Gog", cfg.ghostModeOnlyWhenGame ? "1" : "0", path);
+    WritePrivateProfileStringA("S", "Bop", cfg.boostObsPriority ? "1" : "0", path);
     WritePrivateProfileStringA("S", "Pr", cfg.processList.c_str(), path);
   } else {
     cfg.size = GetPrivateProfileIntA("S", "Sz", 30, path);
@@ -281,11 +288,35 @@ void IOCfg(bool save) {
     cfg.autoStart = GetPrivateProfileIntA("S", "Au", 0, path) == 1;
     cfg.showOverloadWarn = GetPrivateProfileIntA("S", "Ow", 0, path) == 1;
     cfg.ghostMode = GetPrivateProfileIntA("S", "Gm", 0, path) == 1;
+    cfg.ghostModeOnlyWhenGame = GetPrivateProfileIntA("S", "Gog", 0, path) == 1;
+    cfg.boostObsPriority = GetPrivateProfileIntA("S", "Bop", 0, path) == 1;
     cfg.mode = GetPrivateProfileIntA("S", "Md", 0, path);
     char buf[4096] = {0};
     GetPrivateProfileStringA("S", "Pr", "", buf, 4096, path);
     cfg.processList = buf;
   }
+}
+
+// --- SYSTEM HELPERS ---
+void SetProcessPriority(const char* processName, DWORD priorityClass) {
+  HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnap == INVALID_HANDLE_VALUE) return;
+
+  PROCESSENTRY32 pe32;
+  pe32.dwSize = sizeof(PROCESSENTRY32);
+
+  if (Process32First(hSnap, &pe32)) {
+    do {
+      if (_stricmp(pe32.szExeFile, processName) == 0) {
+        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (hProcess) {
+          SetPriorityClass(hProcess, priorityClass);
+          CloseHandle(hProcess);
+        }
+      }
+    } while (Process32Next(hSnap, &pe32));
+  }
+  CloseHandle(hSnap);
 }
 
 // --- NETWORKING ---
@@ -399,26 +430,22 @@ void NetThread() {
         DWORD lastPollStr = 0;
         DWORD lastPollStats = 0;
         int lastSkippedFrames = -1;
+        bool initialPollDone = false;
 
         while (true) {
           DWORD now = GetTickCount();
 
           if (authenticated) {
-            // Interleave polling to avoid packet merging/collision issues in
-            // simple parser
-            if (now - lastPollRec > 3000) {
-              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetRecordStatus\","
-                        "\"requestId\":\"pollR\"}}");
-              lastPollRec = now;
+            // Initial poll to get current state (only once)
+            if (!initialPollDone) {
+               SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetRecordStatus\",\"requestId\":\"pollR\"}}");
+               SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStreamStatus\",\"requestId\":\"pollS\"}}");
+               initialPollDone = true;
             }
-            if (now - lastPollStr > 3000 && now - lastPollRec > 1500) {
-              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStreamStatus\","
-                        "\"requestId\":\"pollS\"}}");
-              lastPollStr = now;
-            }
+
+            // Poll stats continuously for encoder overload detection
             if (now - lastPollStats > 2000) {
-              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStats\","
-                        "\"requestId\":\"pollSt\"}}");
+              SendWS(s, "{\"op\":6,\"d\":{\"requestType\":\"GetStats\",\"requestId\":\"pollSt\"}}");
               lastPollStats = now;
             }
           }
@@ -438,9 +465,8 @@ void NetThread() {
               authenticated = true;
               isConn = true;
               PostMessage(hMain, WM_OBS, 0, 0);
-              // Reset timers to poll immediately
-              lastPollRec = 0;
-              lastPollStr = 0;
+              // Reset state to poll immediately
+              initialPollDone = false;
               lastPollStats = 0;
             }
 
@@ -603,18 +629,21 @@ void DrawUI(HDC hdc, int w, int h) {
     TextOutA(dc, S(C2 + 20), S(70), "Size:", 5);
 
     // Group Padding, Size, Ghost Mode, Overload (Wider and Taller to fit note)
-    Grp(C2, 10, 360, 270, "Appearance"); // H=270, Bottom=280
-    
+    Grp(C2, 10, 360, 300, "Appearance"); // H=300, Bottom=310
+
     // Ghost Mode (Always Render)
-    Tick(55, C2 + 20, 130, "Always Render (Invisible when idle)", cfg.ghostMode);
-    
+    Tick(55, C2 + 20, 130, "Always render (Invisible when idle)", cfg.ghostMode);
+
+    // Always render only when game is active
+    Tick(56, C2 + 20, 170, "Always render only when game active", cfg.ghostModeOnlyWhenGame);
+
     // Show encoder overload warnings
-    Tick(54, C2 + 20, 170, "Show encoder overload warnings", cfg.showOverloadWarn);
-    
-    // Info text for overload warning
+    Tick(54, C2 + 20, 210, "Show encoder overload warnings", cfg.showOverloadWarn);
+
+    // Info text for overload warning (directly below checkbox)
     {
-      // Checkbox is at 170. Note at 200.
-      RECT rInfo = {S(C2 + 40), S(200), S(C2 + 350), S(270)}; // Increased H to avoid truncation
+      // Checkbox at 210, note at 240
+      RECT rInfo = {S(C2 + 40), S(240), S(C2 + 350), S(290)};
       SetTextColor(dc, RGB(150, 150, 150));
       DrawTextA(dc,
                 "Note: May show false positives caused by\nhigh CPU load "
@@ -624,25 +653,28 @@ void DrawUI(HDC hdc, int w, int h) {
     }
 
     // Draw Mode Group (Narrowed to fit in Col 1)
-    Grp(C1, 260, 220, 120, "Mode");
-    Tick(50, C1 + 20, 280, "Information Indicator", cfg.mode == MODE_INFO);
-    Tick(51, C1 + 20, 310, "Warning Indicator", cfg.mode == MODE_WARN);
-    Tick(52, C1 + 20, 340, "Warning Only", cfg.mode == MODE_WARN_ONLY);
+    Grp(C1, 275, 220, 120, "Mode"); // H=120, Bottom=395
+    Tick(50, C1 + 20, 295, "Information Indicator", cfg.mode == MODE_INFO);
+    Tick(51, C1 + 20, 325, "Warning & Indicator", cfg.mode == MODE_WARN);
+    Tick(52, C1 + 20, 355, "Warning Only", cfg.mode == MODE_WARN_ONLY);
 
-    // Controls Below Appearance Group (Y > 280)
-    
-    // WebSocket Password (Label at 290)
-    TextOutA(dc, S(C2), S(290), "WebSocket Password:", 19);
+    // System Group (Below Mode in Col 1)
+    Grp(C1, 405, 220, 50, "System");
+    Tick(57, C1 + 20, 425, "Boost OBS Priority", cfg.boostObsPriority);
+
+    // Controls Below Both Groups (Starting at Y=320)
+    // WebSocket Password
+    TextOutA(dc, S(C2), S(320), "WebSocket Password:", 19);
 
     // Buttons
-    // Test Overlay (Align with Password Edit at Y=312)
-    Btn(41, C3, 312, isTest ? "Stop Test" : "Test Overlay", isTest);
-    
-    // Edit Processes (Below Password)
-    Btn(53, C2, 350, "Edit Processes", false);
-    
-    Tick(40, C3, 355, "Launch on Startup", cfg.autoStart);
-    Btn(42, C3, 395, "View License", false);
+    // Test Overlay (in C3 column, aligned with password edit below)
+    Btn(41, C3, 335, isTest ? "Stop Test" : "Test Overlay", isTest);
+
+    // Edit Processes (Below password label)
+    Btn(53, C2, 385, "Edit Processes", false);
+
+    Tick(40, C3, 385, "Launch on Startup", cfg.autoStart);
+    Btn(42, C3, 415, "View License", false);
 
     // Status Line
     char st[100];
@@ -667,7 +699,9 @@ void DrawUI(HDC hdc, int w, int h) {
     }
 
     SetTextColor(dc, stCol);
-    TextOutA(dc, S(C1), S(440), st, strlen(st));
+    SelectObject(dc, hFb);
+    TextOutA(dc, S(C1), h - S(35), st, strlen(st));
+    SelectObject(dc, hF);
   }
 
   BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
@@ -748,78 +782,69 @@ void UpdateOv() {
   else if (active && cfg.mode != MODE_WARN_ONLY)
     showInd = true;
 
+  bool ghostActive = cfg.ghostMode && (!cfg.ghostModeOnlyWhenGame || IsForegroundTarget());
+
   // Determine Alpha
   BYTE indAlpha = 0;
   bool doUpdateInd = false;
 
-  if (cfg.ghostMode) {
+  if (ghostActive) {
     indAlpha = showInd ? 255 : 1;
-    // Update if Alpha changed, GhostMode toggled, OR Geometry changed
-    // Note: We track winX/winY/fullS in lastOv now effectively?
-    // Using s, p, pos to track geom changes.
-    // Let's use generic check.
-    if (indAlpha != (lastOv.vis ? 255 : 1) || cfg.ghostMode != lastOv.ghost ||
-        lastOv.x != winX || lastOv.y != winY || lastOv.s != fullS) {
-        doUpdateInd = true;
-    }
   } else {
-    // Classic Mode
-    if (showInd) {
-        indAlpha = 255;
-        if (!lastOv.vis || lastOv.x != winX || lastOv.y != winY || lastOv.s != fullS || lastOv.ghost)
-            doUpdateInd = true;
-    } else {
-        if (lastOv.vis || lastOv.ghost) {
-            indAlpha = 0;
-            doUpdateInd = true;
-        }
-    }
+    indAlpha = showInd ? 255 : 0;
   }
-  
+
+  // Determine current color for change detection
+  COLORREF curCol = RGB(255, 0, 0);
+  if (isTest || isRec || isStream) curCol = RGB(255, 0, 0);
+  else if (isConn) curCol = RGB(0, 100, 255); // Blue
+  else curCol = RGB(100, 100, 100); // Gray
+
+  static COLORREF lastCol = 0;
+
+  if (indAlpha != (lastOv.vis ? 255 : (lastOv.ghost ? 1 : 0)) ||
+      curCol != lastCol ||
+      lastOv.x != winX || lastOv.y != winY || lastOv.s != fullS) {
+    doUpdateInd = true;
+  }
+
   if (doUpdateInd) {
     if (indAlpha > 0) {
-         if (!IsWindowVisible(hOv)) ShowWindow(hOv, SW_SHOWNA);
-         // Move to PADDED position
-         SetWindowPos(hOv, HWND_TOPMOST, winX, winY, fullS, fullS, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+      if (!IsWindowVisible(hOv)) ShowWindow(hOv, SW_SHOWNA);
+      SetWindowPos(hOv, HWND_TOPMOST, winX, winY, fullS, fullS, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-         if (!cfg.ghostMode) 
-             SetWindowPos(hOv, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+      if (!cfg.ghostMode)
+        SetWindowPos(hOv, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
     }
-    
+
     UpdateLayered(hOv, winX, winY, fullS, fullS, indAlpha, [&](HDC dc) {
       if (indAlpha == 1) {
-          // Draw 1x1 Pixel at Calculated Offset
-          HBRUSH hInv = CreateSolidBrush(RGB(0, 0, 1));
-          RECT rPixel = {pixX, pixY, pixX + 1, pixY + 1};
-          FillRect(dc, &rPixel, hInv);
-          DeleteObject(hInv);
-          return;
+        HBRUSH hInv = CreateSolidBrush(RGB(0, 0, 1));
+        RECT rPixel = {pixX, pixY, pixX + 1, pixY + 1};
+        FillRect(dc, &rPixel, hInv);
+        DeleteObject(hInv);
+        return;
       }
-      
-      // Fill Black (Key)
+
       HBRUSH hBlack = CreateSolidBrush(RGB(0, 0, 0));
       RECT r = {0, 0, fullS, fullS};
       FillRect(dc, &r, hBlack);
       DeleteObject(hBlack);
 
-      // Draw Red Circle / White Border at Indicator Offset
       HPEN hPen = CreatePen(PS_SOLID, S(2), RGB(255, 255, 255));
-      HBRUSH hBrush = CreateSolidBrush(RGB(255, 0, 0));
+      HBRUSH hBrush = CreateSolidBrush(curCol);
       HPEN hOldPen = (HPEN)SelectObject(dc, hPen);
       HBRUSH hOldBrush = (HBRUSH)SelectObject(dc, hBrush);
-      // Circle Rect: indX, indY, indX+s, indY+s
-      // Adjust for Pen (S(1) offset inside the circle rect?)
-      // Original: Ellipse(dc, S(1), S(1), s - S(1), s - S(1)); 
-      // We need to shift this by indX, indY
       Ellipse(dc, indX + S(1), indY + S(1), indX + s - S(1), indY + s - S(1));
-      
+
       SelectObject(dc, hOldPen);
       SelectObject(dc, hOldBrush);
       DeleteObject(hBrush);
       DeleteObject(hPen);
     });
-    
-    lastOv = {winX, winY, fullS, showInd, cfg.ghostMode};
+
+    lastOv = {winX, winY, fullS, showInd, ghostActive};
+    lastCol = curCol;
   }
 
   // Warning Overlay Update
@@ -836,11 +861,11 @@ void UpdateOv() {
   // But we can cache the last text/state to avoid ULW calls.
   static std::string lastMsg = "";
 
-  if (cfg.ghostMode) {
+  if (ghostActive) {
       // In ghost mode: warning window uses alpha=0 when hidden (100% invisible)
       // Only the indicator overlay's 1x1 pixel uses alpha=1 for MPO prevention
       warnAlpha = showW ? 255 : 0;
-      if ((warnAlpha > 0) != lastWarnVis || cfg.ghostMode != lastOv.ghost || msg != lastMsg)
+      if ((warnAlpha > 0) != lastWarnVis || ghostActive != lastOv.ghost || msg != lastMsg)
           doUpdateWarn = true;
   } else {
       if (showW) {
@@ -1016,8 +1041,8 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
       // Move Edit Boxes to new positions
       MoveWindow(hEditPad, C2 + S(100), S(28), S(60), S(24), 1);
       MoveWindow(hEditSize, C2 + S(100), S(68), S(60), S(24), 1);
-      // Password Edit: Y=312 (Below 290 Label)
-      MoveWindow(hEditPass, C2, S(312), S(160), S(24), 1);
+      // Password Edit: Y=350 (Below 320 Label)
+      MoveWindow(hEditPass, C2, S(350), S(160), S(24), 1);
       ShowWindow(hEditPad, 1);
       ShowWindow(hEditSize, 1);
       ShowWindow(hEditPass, 1);
@@ -1036,7 +1061,7 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
       s = ReplaceAll(s, "\r\n", "|");
       cfg.processList = s;
     }
-    IOCfg(true);
+    configDirtyTime = GetTickCount() + 1000; // Save in 1s
     UpdateOv();
     if (isTest)
       InvalidateRect(hOv, NULL, FALSE);
@@ -1093,16 +1118,23 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           cfg.showOverloadWarn = !cfg.showOverloadWarn;
         if (hit.id == 55)
           cfg.ghostMode = !cfg.ghostMode;
+        if (hit.id == 56)
+          cfg.ghostModeOnlyWhenGame = !cfg.ghostModeOnlyWhenGame;
+        if (hit.id == 57) {
+          cfg.boostObsPriority = !cfg.boostObsPriority;
+          SetProcessPriority("obs64.exe", cfg.boostObsPriority ? ABOVE_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+        }
 
-        IOCfg(true);
+        configDirtyTime = GetTickCount() + 1000; // Save in 1s
         UpdateOv();
         InvalidateRect(h, 0, 0);
         SendMessage(h, WM_SIZE, 0, 0);
         if (isTest)
           InvalidateRect(hOv, NULL, FALSE);
       }
-  } else if (m == WM_TIMER && w == TIMER_WARN) {
-    if (cfg.mode == MODE_WARN || cfg.mode == MODE_WARN_ONLY) {
+  } else if (m == WM_TIMER) {
+    if (w == TIMER_WARN) {
+      if (cfg.mode == MODE_WARN || cfg.mode == MODE_WARN_ONLY) {
       DWORD now = GetTickCount();
 
       // Check Focus Every Timer Tick (cached, low overhead)
@@ -1152,6 +1184,18 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (GetTickCount() > overloadWarnUntil)
         UpdateOv();
     }
+
+    // Always update overlay in info mode (timer doesn't call UpdateOv otherwise)
+    if (cfg.mode == MODE_INFO)
+      UpdateOv();
+    } // End of TIMER_WARN
+
+    // Check for delayed config save
+    if (configDirtyTime > 0 && GetTickCount() > configDirtyTime) {
+        IOCfg(true);
+        configDirtyTime = 0;
+    }
+
   } else if (m == WM_OBS) {
     UpdateOv();
     InvalidateRect(h, 0, 0);
@@ -1171,12 +1215,12 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     // We want fixed client size 640x480 (scaled)
     // We'll calculate the window rect for that and enforcing it.
     // Or simpler: lock to the size set in WinMain.
-    // However, M doesn't know WinMain vars readily. 
+    // However, M doesn't know WinMain vars readily.
     // We can just recalculate quickly or use static.
     static POINT sz = {0, 0};
     if (sz.x == 0) {
        DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
-       RECT wr = {0, 0, S(640), S(480)};
+       RECT wr = {0, 0, S(640), S(510)};
        AdjustWindowRect(&wr, style, FALSE);
        sz.x = wr.right - wr.left;
        sz.y = wr.bottom - wr.top;
@@ -1193,8 +1237,17 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   if (CreateMutex(0, 1, "OBSIndM") && GetLastError() == ERROR_ALREADY_EXISTS)
     return 0;
+  
+  // Set self priority to below normal
+  SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+
   IOCfg(false);
   g_Scale = GetDpiForSystem() / 96.0f;
+  
+  // Apply initial OBS priority if enabled
+  if (cfg.boostObsPriority)
+    SetProcessPriority("obs64.exe", ABOVE_NORMAL_PRIORITY_CLASS);
+
   InitGDI();
 
   WNDCLASS wc = {0};
@@ -1227,8 +1280,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   RegisterClass(&wc);
 
   DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
-  // Increased Window Height to 480
-  RECT wr = {0, 0, S(640), S(480)};
+  // Window size
+  RECT wr = {0, 0, S(640), S(510)};
   AdjustWindowRect(&wr, style, FALSE);
 
   int scrW = GetSystemMetrics(SM_CXSCREEN);
@@ -1249,8 +1302,8 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   strcpy(nid.szTip, "OBS Indicator");
   Shell_NotifyIcon(NIM_ADD, &nid);
 
-  BOOL d = 1;
-  DwmSetWindowAttribute(hMain, 20, &d, 4);
+  BOOL darkMode = TRUE;
+  DwmSetWindowAttribute(hMain, 20, &darkMode, 4);
   std::thread(NetThread).detach();
   if (strstr(p, "--tray"))
     ShowWindow(hMain, SW_HIDE);
