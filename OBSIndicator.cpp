@@ -113,7 +113,8 @@ const char *LIC_TEXT =
 // --- HELPERS ---
 int S(int v) { return (int)(v * g_Scale); }
 void Wipe(std::string &s) {
-  SecureZeroMemory(&s[0], s.size());
+  if (!s.empty())
+    SecureZeroMemory(&s[0], s.size());
   s.clear();
 }
 
@@ -294,17 +295,47 @@ void IOCfg(bool save) {
     char buf[4096] = {0};
     GetPrivateProfileStringA("S", "Pr", "", buf, 4096, path);
     cfg.processList = buf;
+    
+    // Bounds checking for config values
+    if (cfg.size < 10) cfg.size = 10;
+    if (cfg.size > 200) cfg.size = 200;
+    if (cfg.pad < 0) cfg.pad = 0;
+    if (cfg.pad > 100) cfg.pad = 100;
+    if (cfg.pos < 0 || cfg.pos > 3) cfg.pos = 0;
+    if (cfg.mode < 0 || cfg.mode > 2) cfg.mode = 0;
   }
 }
 
 // --- SYSTEM HELPERS ---
+// Track OBS processes that have been boosted to avoid redundant calls
+static std::vector<DWORD> g_boostedPids;
+
 void SetProcessPriority(const char* processName, DWORD priorityClass) {
   HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (hSnap == INVALID_HANDLE_VALUE) return;
 
+#ifdef UNICODE
+  PROCESSENTRY32W pe32;
+  pe32.dwSize = sizeof(PROCESSENTRY32W);
+  
+  if (Process32FirstW(hSnap, &pe32)) {
+    do {
+      // Convert wide char to multibyte
+      char exeFile[MAX_PATH];
+      wcstombs(exeFile, pe32.szExeFile, MAX_PATH);
+      if (_stricmp(exeFile, processName) == 0) {
+        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
+        if (hProcess) {
+          SetPriorityClass(hProcess, priorityClass);
+          CloseHandle(hProcess);
+        }
+      }
+    } while (Process32NextW(hSnap, &pe32));
+  }
+#else
   PROCESSENTRY32 pe32;
   pe32.dwSize = sizeof(PROCESSENTRY32);
-
+  
   if (Process32First(hSnap, &pe32)) {
     do {
       if (_stricmp(pe32.szExeFile, processName) == 0) {
@@ -316,7 +347,80 @@ void SetProcessPriority(const char* processName, DWORD priorityClass) {
       }
     } while (Process32Next(hSnap, &pe32));
   }
+#endif
   CloseHandle(hSnap);
+}
+
+// Improved priority boost that tracks PIDs and handles new processes
+void BoostObsPriorityIfNeeded() {
+  if (!cfg.boostObsPriority) return;
+  
+  HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnap == INVALID_HANDLE_VALUE) return;
+
+#ifdef UNICODE
+  PROCESSENTRY32W pe32;
+  pe32.dwSize = sizeof(PROCESSENTRY32W);
+#else
+  PROCESSENTRY32 pe32;
+  pe32.dwSize = sizeof(PROCESSENTRY32);
+#endif
+  bool foundAny = false;
+
+#ifdef UNICODE
+  if (Process32FirstW(hSnap, &pe32)) {
+    do {
+      char exeFile[MAX_PATH];
+      wcstombs(exeFile, pe32.szExeFile, MAX_PATH);
+      if (_stricmp(exeFile, "obs64.exe") == 0) {
+#else
+  if (Process32First(hSnap, &pe32)) {
+    do {
+      if (_stricmp(pe32.szExeFile, "obs64.exe") == 0) {
+#endif
+        foundAny = true;
+        DWORD pid = pe32.th32ProcessID;
+        
+        // Check if this PID was already boosted
+        bool alreadyBoosted = false;
+        for (DWORD boostedPid : g_boostedPids) {
+          if (boostedPid == pid) {
+            alreadyBoosted = true;
+            break;
+          }
+        }
+        
+        if (!alreadyBoosted) {
+          HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+          if (hProcess) {
+            SetPriorityClass(hProcess, ABOVE_NORMAL_PRIORITY_CLASS);
+            CloseHandle(hProcess);
+            g_boostedPids.push_back(pid);
+          }
+        }
+      }
+#ifdef UNICODE
+    } while (Process32NextW(hSnap, &pe32));
+#else
+    } while (Process32Next(hSnap, &pe32));
+#endif
+  }
+  CloseHandle(hSnap);
+  
+  // Clean up stale PIDs (processes that no longer exist)
+  if (foundAny) {
+    auto it = g_boostedPids.begin();
+    while (it != g_boostedPids.end()) {
+      HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, *it);
+      if (hProcess) {
+        CloseHandle(hProcess);
+        ++it;
+      } else {
+        // Process no longer exists, remove from tracking
+        it = g_boostedPids.erase(it);
+      }
+    }
+  }
 }
 
 // --- NETWORKING ---
@@ -325,7 +429,10 @@ std::string JsonVal(const std::string &json, const std::string &key) {
   size_t p = json.find(q);
   if (p == std::string::npos)
     return "";
-  p = json.find(":", p) + 1;
+  p = json.find(":", p);
+  if (p == std::string::npos)
+    return "";
+  p++; // Move past the colon
   while (p < json.size() && (isspace(json[p]) || json[p] == '"'))
     p++;
   size_t e = p;
@@ -468,6 +575,8 @@ void NetThread() {
               // Reset state to poll immediately
               initialPollDone = false;
               lastPollStats = 0;
+              // Boost OBS priority if enabled (connection established means OBS is running)
+              BoostObsPriorityIfNeeded();
             }
 
             // Check Recording Status
@@ -881,56 +990,60 @@ void UpdateOv() {
   }
 
   if (doUpdateWarn) {
-    if (warnAlpha > 0) {
-        if (!IsWindowVisible(hWarn)) ShowWindow(hWarn, SW_SHOWNA);
-        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    } else {
-        // Hide warning window when not visible (even in ghost mode)
-        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
-    }
+   if (warnAlpha > 0) {
+       if (!IsWindowVisible(hWarn)) ShowWindow(hWarn, SW_SHOWNA);
+       SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+   } else {
+       // Hide warning window when not visible (even in ghost mode)
+       SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+   }
 
-    // Check Cache Validity
-    bool cacheStale = (msg != g_lastWarnMsg) || (g_hBmWarn == NULL);
-    
-    // Position/Size must be recalculated if message changes OR scale changes (which we don't handle dynamic DPI yet fully, but assuming S stays same)
-    // Actually, position depends on screen size too. We calculate Pos every frame anyway.
+   // Check Cache Validity
+   bool cacheStale = (msg != g_lastWarnMsg) || (g_hBmWarn == NULL);
+   
+   // Position/Size must be recalculated if message changes OR scale changes (which we don't handle dynamic DPI yet fully, but assuming S stays same)
+   // Actually, position depends on screen size too. We calculate Pos every frame anyway.
 
-    if (cacheStale) {
-        // 1. Calculate Size
-        HDC hdcScreen = GetDC(NULL);
-        // Use temp DC for measurment
-        HDC dc = CreateCompatibleDC(hdcScreen);
-        SelectObject(dc, g_hFontWarn); // Use cached font
-        RECT rText = {0, 0, 0, 0};
-        DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
-        int wW = rText.right - rText.left + S(20);
-        int wH = rText.bottom - rText.top + S(10);
-        DeleteDC(dc);
-        
-        // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
-        if (g_hBmWarn) DeleteObject(g_hBmWarn);
-        g_hBmWarn = CreateCompatibleBitmap(hdcScreen, wW, wH);
-        
-        // 3. Draw into Cached Bitmap
-        SelectObject(g_hdcWarn, g_hBmWarn);
-        SelectObject(g_hdcWarn, g_hFontWarn);
-        SetTextColor(g_hdcWarn, COL_WARN_TEXT);
-        SetBkMode(g_hdcWarn, TRANSPARENT);
-        
-        // Fill Black (Key)
-        RECT rFill = {0, 0, wW, wH};
-        HBRUSH hK = CreateSolidBrush(RGB(0, 0, 0));
-        FillRect(g_hdcWarn, &rFill, hK);
-        DeleteObject(hK);
-        
-        RECT rT = {S(10), S(5), wW, wH};
-        DrawTextA(g_hdcWarn, msg, -1, &rT, DT_LEFT | DT_TOP | DT_NOCLIP);
-        
-        ReleaseDC(NULL, hdcScreen);
-        
-        g_sizeWarn = {wW, wH};
-        g_lastWarnMsg = msg;
-    }
+   if (cacheStale) {
+       // 1. Calculate Size
+       HDC hdcScreen = GetDC(NULL);
+       // Use temp DC for measurment
+       HDC dc = CreateCompatibleDC(hdcScreen);
+       SelectObject(dc, g_hFontWarn); // Use cached font
+       RECT rText = {0, 0, 0, 0};
+       DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
+       int wW = rText.right - rText.left + S(20);
+       int wH = rText.bottom - rText.top + S(10);
+       DeleteDC(dc);
+       
+       // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
+       // FIX: Select bitmap out of DC before deleting to avoid GDI resource leak
+       if (g_hBmWarn) {
+           SelectObject(g_hdcWarn, NULL);
+           DeleteObject(g_hBmWarn);
+       }
+       g_hBmWarn = CreateCompatibleBitmap(hdcScreen, wW, wH);
+       
+       // 3. Draw into Cached Bitmap
+       SelectObject(g_hdcWarn, g_hBmWarn);
+       SelectObject(g_hdcWarn, g_hFontWarn);
+       SetTextColor(g_hdcWarn, COL_WARN_TEXT);
+       SetBkMode(g_hdcWarn, TRANSPARENT);
+       
+       // Fill Black (Key)
+       RECT rFill = {0, 0, wW, wH};
+       HBRUSH hK = CreateSolidBrush(RGB(0, 0, 0));
+       FillRect(g_hdcWarn, &rFill, hK);
+       DeleteObject(hK);
+       
+       RECT rT = {S(10), S(5), wW, wH};
+       DrawTextA(g_hdcWarn, msg, -1, &rT, DT_LEFT | DT_TOP | DT_NOCLIP);
+       
+       ReleaseDC(NULL, hdcScreen);
+       
+       g_sizeWarn = {wW, wH};
+       g_lastWarnMsg = msg;
+   }
     
     // Calculate Position based on Corner (always dynamic)
     int wx = 0, wy = 0;
@@ -960,6 +1073,7 @@ void UpdateOv() {
     UpdateLayeredWindow(hWarn, NULL, &ptDst, &size, g_hdcWarn, &ptSrc, RGB(0,0,0), &blend, flags);
 
     lastWarnVis = warnAlpha > 0;
+    lastMsg = msg;  // FIX: Update lastMsg to prevent redundant redraws
   }
 }
 
@@ -1122,7 +1236,13 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           cfg.ghostModeOnlyWhenGame = !cfg.ghostModeOnlyWhenGame;
         if (hit.id == 57) {
           cfg.boostObsPriority = !cfg.boostObsPriority;
-          SetProcessPriority("obs64.exe", cfg.boostObsPriority ? ABOVE_NORMAL_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS);
+          if (cfg.boostObsPriority) {
+            BoostObsPriorityIfNeeded();
+          } else {
+            // Reset priority to normal for all OBS processes
+            SetProcessPriority("obs64.exe", NORMAL_PRIORITY_CLASS);
+            g_boostedPids.clear();
+          }
         }
 
         configDirtyTime = GetTickCount() + 1000; // Save in 1s
@@ -1246,7 +1366,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   
   // Apply initial OBS priority if enabled
   if (cfg.boostObsPriority)
-    SetProcessPriority("obs64.exe", ABOVE_NORMAL_PRIORITY_CLASS);
+    BoostObsPriorityIfNeeded();
 
   InitGDI();
 
