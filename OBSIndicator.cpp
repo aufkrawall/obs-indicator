@@ -962,9 +962,7 @@ void UpdateOv() {
   BYTE warnAlpha = 0;
   bool doUpdateWarn = false;
   
-  const char *msg = "OBS INACTIVE";
-  if (cfg.showOverloadWarn && GetTickCount() < overloadWarnUntil)
-      msg = "Encoder overloaded!";
+  const char *msg = showOverload ? "Encoder overloaded!" : "OBS INACTIVE";
 
   // We need to calculate position and size every time because text might change or pos might change
   // But we can cache the last text/state to avoid ULW calls.
@@ -1299,10 +1297,16 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     // ALSO Check Overload Expiry (to hide window when time is up)
-    if (cfg.showOverloadWarn && overloadWarnUntil > 0) {
-      // Just triggering an update occasionally or checking if we need to hide
-      if (GetTickCount() > overloadWarnUntil)
+    // Check even if overloadWarnUntil is 0 (connection drop) to clear stuck warning
+    if (cfg.showOverloadWarn) {
+      // Trigger update when overload expires OR when connection drops (overloadWarnUntil reset to 0)
+      static DWORD lastOverloadWarnUntil = 0;
+      DWORD current = overloadWarnUntil.load();
+      if ((lastOverloadWarnUntil > 0 && current == 0) || 
+          (current > 0 && GetTickCount() > current)) {
         UpdateOv();
+      }
+      lastOverloadWarnUntil = current;
     }
 
     // Always update overlay in info mode (timer doesn't call UpdateOv otherwise)
