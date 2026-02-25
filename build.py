@@ -1,4 +1,3 @@
-import os
 import sys
 import subprocess
 import urllib.request
@@ -59,12 +58,11 @@ def ensure_zig():
 
 def check_requirements():
     if not Path(ICON_FILE).exists():
-        fail(f"'{ICON_FILE}' not found! Please run 'python generate_icon.py' first.")
+        fail(f"'{ICON_FILE}' not found in repository root.")
 
-def generate_compile_commands(zig_exe_path):
+def generate_compile_commands():
     # Create compile_commands.json for LSP support
-    # We use clang++ as the command to ensure standard clangd picks it up,
-    # but we add explicit -isystem paths to Zig's bundled headers.
+    # We use clang++ so clangd can parse flags reliably.
     
     # Use relative paths to avoid absolute paths/usernames in the generated file
     # Paths are relative to the workspace root (where compile_commands.json resides)
@@ -80,7 +78,6 @@ def generate_compile_commands(zig_exe_path):
     
     include_flags = " ".join([f'-isystem "{p}"'.replace("\\", "/") for p in includes])
     
-    # Note: We use clang++ here because clangd recognizes it better than zig.exe
     cmd_str = (
         'clang++ '
         "--driver-mode=g++ "
@@ -88,13 +85,21 @@ def generate_compile_commands(zig_exe_path):
         "-std=c++17 "
         "-Os "
         "-DNDEBUG "
+        "-D_WIN32_WINNT=0x0A00 "
+        "-DWINVER=0x0A00 "
+        "-DWIN32_LEAN_AND_MEAN "
+        "-D_WINSOCK_DEPRECATED_NO_WARNINGS "
+        "-D_CRT_SECURE_NO_WARNINGS "
+        "-Wall -Wextra -Wpedantic "
+        "-Wformat -Wformat-security "
+        "-Wno-missing-field-initializers "
         f"{include_flags} "
         f"-c {SOURCE_FILE}"
     )
     
     data = [
         {
-            "directory": ".",
+            "directory": str(Path.cwd()),
             "command": cmd_str,
             "file": SOURCE_FILE
         }
@@ -108,9 +113,10 @@ def generate_compile_commands(zig_exe_path):
 def build():
     # 1. Generate Resource File
     log("Compiling resources...")
-    # Create simple RC file if it doesn't exist or update it
-    with open(RC_FILE, "w") as f:
-        f.write(f'101 ICON "{ICON_FILE}"\n')
+    rc_content = f'101 ICON "{ICON_FILE}"\n'
+    rc_path = Path(RC_FILE)
+    if not rc_path.exists() or rc_path.read_text(encoding="utf-8") != rc_content:
+        rc_path.write_text(rc_content, encoding="utf-8")
 
     # Use zig rc (llvm-rc) to compile resources
     # zig rc command: zig rc [options] <file>
@@ -120,43 +126,36 @@ def build():
     # Run resource compiler
     result = subprocess.run(res_cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        # Fallback: try compiling .rc directly with zig c++ if zig rc fails or behaves unexpectedly
-        # But standard way is 'zig rc'. Let's see if we need special flags.
-        # Windows rc.exe /fo outputs .res. llvm-rc also supports /fo.
         print(result.stderr)
         fail("Resource compilation failed.")
 
     # 2. Compile C++ Application
     log("Compiling C++ application...")
     
-    # Zig c++ acts as a clang driver
-    # We use -target x86_64-windows-gnu to link against MinGW/libstdc++ equivalent or 
-    # -target x86_64-windows-msvc to link against MSVC CRT.
-    # The original build.bat used UCRT64 (MinGW-w64 UCRT).
-    # Zig's default for windows is usually native-msvc if MSVC is installed, or gnu.
-    # To be self-contained and match 'static' linking, we might want 'x86_64-windows-gnu'.
-    # However, Zig ships its own libc/libc++ wrappers.
-    # Let's try default target first, or force gnu.
-    
-    # Flags from build.bat:
-    # -std=c++17 -Os -DNDEBUG -mwindows -static -s -ffunction-sections -fdata-sections
-    # -fuse-ld=lld -Wl,--gc-sections
-    # Libraries: -lws2_32 -lgdi32 -luser32 -lshell32 -ldwmapi -ladvapi32 -lcrypt32 -luxtheme
-    
     cmd = [
         str(ZIG_EXE), "c++",
-        "-target", "x86_64-windows-gnu", # Force GNU ABI to ensure static linking works as expected with MinGW-style libs if needed
+        "-target", "x86_64-windows-gnu",
         "-std=c++17",
         "-Os",
         "-DNDEBUG",
+        "-Wall",
+        "-Wextra",
+        "-Wpedantic",
+        "-Wformat",
+        "-Wformat-security",
+        "-Wno-missing-field-initializers",
+        "-fstack-protector-strong",
         "-mwindows",
         "-Wl,--subsystem,windows",
+        "-Wl,--dynamicbase",
+        "-Wl,--high-entropy-va",
+        "-Wl,--nxcompat",
         "-static",
-        "-s", # strip
+        "-s",
         "-ffunction-sections",
         "-fdata-sections",
         SOURCE_FILE,
-        RES_FILE, # Link the compiled resource
+        RES_FILE,
         "-o", EXE_NAME,
         "-lws2_32",
         "-lgdi32",
@@ -169,16 +168,18 @@ def build():
         "-Wl,--gc-sections"
     ]
     
-    # Note: Zig's clang driver might not need -fuse-ld=lld as it uses lld by default.
-    
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
         fail("Compilation failed.")
         
     log(f"Success! Created {EXE_NAME}")
     
     # Generate LSP file
-    generate_compile_commands(ZIG_EXE)
+    generate_compile_commands()
 
 def main():
     check_requirements()

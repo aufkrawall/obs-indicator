@@ -1,9 +1,20 @@
 #define _CRT_SECURE_NO_WARNINGS
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0A00
+#elif _WIN32_WINNT < 0x0A00
+#undef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WINVER
 #define WINVER 0x0A00
+#elif WINVER < 0x0A00
+#undef WINVER
+#define WINVER 0x0A00
+#endif
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
 
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -12,30 +23,38 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#endif
 
-#include <algorithm>
-#include <atomic>
-#include <ctime>
+// Winsock must be included before windows.h
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <windowsx.h>
+
+// Windows subsystem headers
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <tlhelp32.h>
+#include <uxtheme.h>
+#include <wincrypt.h>
+
+// C++ standard library
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <functional>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <uxtheme.h>
 #include <vector>
-#include <functional>
-#include <wincrypt.h>
-#include <windows.h>
-#include <windowsx.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <tlhelp32.h>
 
 // --- CONSTANTS ---
 #define WM_TRAY (WM_USER + 1)
 #define WM_OBS (WM_USER + 2)
 #define TIMER_WARN 999
-#define TIMER_SAVE 998 // Timer for delayed saving
 #define IDI_MAIN_ICON 101
 
 // Palette
@@ -66,16 +85,19 @@ struct AppState {
   bool boostObsPriority = false;
 } cfg;
 
-struct {
+struct OvState {
   int x = -1, y = -1, s = -1;
   bool vis = false;
   bool ghost = false;
-} lastOv;
+};
+OvState lastOv;
 bool lastWarnVis = false; // Optimize warning window updates
 std::atomic<bool> isRec(false), isStream(false), isConn(false), isTest(false);
 std::atomic<bool> g_shutdown(false);  // Graceful shutdown flag
-std::atomic<DWORD> overloadWarnUntil(0);
-std::atomic<DWORD> configDirtyTime(0); // For debounced saving
+std::atomic<bool> g_boostObsPriority(false);
+std::atomic<ULONGLONG> overloadWarnUntil(0);
+std::atomic<ULONGLONG> configDirtyTime(0); // For debounced saving
+bool g_passwordDirty = false;
 bool showLic = false;
 bool showProcList = false;
 float g_Scale = 1.0f;
@@ -83,7 +105,9 @@ float g_Scale = 1.0f;
 HWND hMain = NULL, hOv = NULL, hWarn = NULL;
 HWND hEditPad = NULL, hEditSize = NULL, hEditPass = NULL, hEditLic = NULL,
      hEditProcs = NULL;
-NOTIFYICONDATA nid = {sizeof(NOTIFYICONDATA)};
+NOTIFYICONDATA nid = {};
+std::thread g_netThread;
+HANDLE g_singleInstanceMutex = NULL;
 
 // Warning Logic State
 bool warnActive = false;
@@ -116,6 +140,22 @@ void Wipe(std::string &s) {
   if (!s.empty())
     SecureZeroMemory(&s[0], s.size());
   s.clear();
+}
+
+bool GetIniPath(char (&path)[MAX_PATH]) {
+  DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH)
+    return false;
+  char *dot = strrchr(path, '.');
+  if (!dot)
+    return false;
+  size_t room = MAX_PATH - static_cast<size_t>(dot - path);
+  return strcpy_s(dot, room, ".ini") == 0;
+}
+
+void NotifyObsUpdate() {
+  if (!g_shutdown.load() && hMain && IsWindow(hMain))
+    PostMessage(hMain, WM_OBS, 0, 0);
 }
 
 // --- STRING HELPER ---
@@ -235,11 +275,9 @@ std::string Auth(std::string &pass, const std::string &salt,
 
 // --- CONFIG ---
 std::string ManagePass(const char *newPass = nullptr) {
-  char path[MAX_PATH];
-  GetModuleFileNameA(NULL, path, MAX_PATH);
-  char *dot = strrchr(path, '.');
-  if (!dot) return "";  // Safety check
-  strcpy(dot, ".ini");
+  char path[MAX_PATH] = {0};
+  if (!GetIniPath(path))
+    return "";
 
   if (newPass) {
     std::string enc =
@@ -252,20 +290,23 @@ std::string ManagePass(const char *newPass = nullptr) {
     if (strlen(buf) == 0)
       return "";
     DWORD len = 0;
-    CryptStringToBinaryA(buf, 0, CRYPT_STRING_BASE64, NULL, &len, 0, 0);
+    if (!CryptStringToBinaryA(buf, 0, CRYPT_STRING_BASE64, NULL, &len, 0, 0) ||
+        len == 0)
+      return "";
     std::string dec(len, 0);
-    CryptStringToBinaryA(buf, 0, CRYPT_STRING_BASE64, (BYTE *)&dec[0], &len, 0,
-                         0);
+    if (!CryptStringToBinaryA(buf, 0, CRYPT_STRING_BASE64, (BYTE *)&dec[0], &len,
+                              0, 0)) {
+      Wipe(dec);
+      return "";
+    }
     return dec;
   }
 }
 
 void IOCfg(bool save) {
-  char path[MAX_PATH];
-  GetModuleFileNameA(NULL, path, MAX_PATH);
-  char *dot = strrchr(path, '.');
-  if (!dot) return;  // Safety check
-  strcpy(dot, ".ini");
+  char path[MAX_PATH] = {0};
+  if (!GetIniPath(path))
+    return;
   if (save) {
     WritePrivateProfileStringA("S", "Sz", std::to_string(cfg.size).c_str(),
                                path);
@@ -295,6 +336,8 @@ void IOCfg(bool save) {
     char buf[4096] = {0};
     GetPrivateProfileStringA("S", "Pr", "", buf, 4096, path);
     cfg.processList = buf;
+    if (cfg.processList.size() > 2048)
+      cfg.processList.resize(2048);
     
     // Bounds checking for config values
     if (cfg.size < 10) cfg.size = 10;
@@ -303,39 +346,34 @@ void IOCfg(bool save) {
     if (cfg.pad > 100) cfg.pad = 100;
     if (cfg.pos < 0 || cfg.pos > 3) cfg.pos = 0;
     if (cfg.mode < 0 || cfg.mode > 2) cfg.mode = 0;
+    g_boostObsPriority = cfg.boostObsPriority;
   }
+}
+
+void SaveConfigNow() {
+  if (g_passwordDirty && hEditPass) {
+    char passBuf[512] = {0};
+    GetWindowTextA(hEditPass, passBuf, 512);
+    ManagePass(passBuf);
+    SecureZeroMemory(passBuf, sizeof(passBuf));
+    g_passwordDirty = false;
+  }
+  IOCfg(true);
+  configDirtyTime = 0;
 }
 
 // --- SYSTEM HELPERS ---
 // Track OBS processes that have been boosted to avoid redundant calls
 static std::vector<DWORD> g_boostedPids;
+static std::mutex g_boostedPidsMutex;
 
 void SetProcessPriority(const char* processName, DWORD priorityClass) {
   HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (hSnap == INVALID_HANDLE_VALUE) return;
 
-#ifdef UNICODE
-  PROCESSENTRY32W pe32;
-  pe32.dwSize = sizeof(PROCESSENTRY32W);
-  
-  if (Process32FirstW(hSnap, &pe32)) {
-    do {
-      // Convert wide char to multibyte
-      char exeFile[MAX_PATH];
-      wcstombs(exeFile, pe32.szExeFile, MAX_PATH);
-      if (_stricmp(exeFile, processName) == 0) {
-        HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe32.th32ProcessID);
-        if (hProcess) {
-          SetPriorityClass(hProcess, priorityClass);
-          CloseHandle(hProcess);
-        }
-      }
-    } while (Process32NextW(hSnap, &pe32));
-  }
-#else
   PROCESSENTRY32 pe32;
   pe32.dwSize = sizeof(PROCESSENTRY32);
-  
+
   if (Process32First(hSnap, &pe32)) {
     do {
       if (_stricmp(pe32.szExeFile, processName) == 0) {
@@ -347,40 +385,27 @@ void SetProcessPriority(const char* processName, DWORD priorityClass) {
       }
     } while (Process32Next(hSnap, &pe32));
   }
-#endif
   CloseHandle(hSnap);
 }
 
-// Improved priority boost that tracks PIDs and handles new processes
+// Priority boost that tracks PIDs and handles new processes
 void BoostObsPriorityIfNeeded() {
-  if (!cfg.boostObsPriority) return;
-  
+  if (!g_boostObsPriority.load()) return;
+
   HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (hSnap == INVALID_HANDLE_VALUE) return;
 
-#ifdef UNICODE
-  PROCESSENTRY32W pe32;
-  pe32.dwSize = sizeof(PROCESSENTRY32W);
-#else
   PROCESSENTRY32 pe32;
   pe32.dwSize = sizeof(PROCESSENTRY32);
-#endif
   bool foundAny = false;
+  std::lock_guard<std::mutex> lock(g_boostedPidsMutex);
 
-#ifdef UNICODE
-  if (Process32FirstW(hSnap, &pe32)) {
-    do {
-      char exeFile[MAX_PATH];
-      wcstombs(exeFile, pe32.szExeFile, MAX_PATH);
-      if (_stricmp(exeFile, "obs64.exe") == 0) {
-#else
   if (Process32First(hSnap, &pe32)) {
     do {
       if (_stricmp(pe32.szExeFile, "obs64.exe") == 0) {
-#endif
         foundAny = true;
         DWORD pid = pe32.th32ProcessID;
-        
+
         // Check if this PID was already boosted
         bool alreadyBoosted = false;
         for (DWORD boostedPid : g_boostedPids) {
@@ -389,7 +414,7 @@ void BoostObsPriorityIfNeeded() {
             break;
           }
         }
-        
+
         if (!alreadyBoosted) {
           HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
           if (hProcess) {
@@ -399,11 +424,7 @@ void BoostObsPriorityIfNeeded() {
           }
         }
       }
-#ifdef UNICODE
-    } while (Process32NextW(hSnap, &pe32));
-#else
     } while (Process32Next(hSnap, &pe32));
-#endif
   }
   CloseHandle(hSnap);
   
@@ -461,21 +482,35 @@ void SendWS(SOCKET s, const std::string &txt) {
 
 void NetThread() {
   WSADATA w;
-  WSAStartup(MAKEWORD(2, 2), &w);  // Initialize once at thread start
+  if (WSAStartup(MAKEWORD(2, 2), &w) != 0)
+    return;
   
-  while (!g_shutdown) {
+  while (!g_shutdown.load()) {
     Sleep(1000);
-    if (g_shutdown) break;
+    if (g_shutdown.load()) break;
     
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    sockaddr_in a = {AF_INET, htons(4455)};
+    if (s == INVALID_SOCKET) {
+      if (!g_shutdown.load())
+        Sleep(1000);
+      continue;
+    }
+
+    // Set socket timeouts to prevent indefinite blocking during shutdown
+    DWORD sockTimeout = 2000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&sockTimeout, sizeof(sockTimeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sockTimeout, sizeof(sockTimeout));
+
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(4455);
     inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
 
-    if (isConn) {
+    if (isConn.load()) {
       isConn = false;
       isRec = false;
       isStream = false;
-      PostMessage(hMain, WM_OBS, 0, 0);
+      NotifyObsUpdate();
     }
 
     if (connect(s, (sockaddr *)&a, sizeof(a)) == 0) {
@@ -491,8 +526,8 @@ void NetThread() {
       std::string bufStr;
       bool handshakeDone = false;
 
-      // Read until we get the full header
-      while (!handshakeDone) {
+      // Read until we get the full header (timeout-safe via SO_RCVTIMEO)
+      while (!handshakeDone && !g_shutdown.load()) {
         int r = recv(s, buf, sizeof(buf), 0);
         if (r <= 0)
           break;
@@ -503,7 +538,7 @@ void NetThread() {
         }
       }
 
-      if (handshakeDone && bufStr.find("101") != std::string::npos) {
+      if (handshakeDone && bufStr.find("HTTP/1.1 101") != std::string::npos) {
         // Check if we have extra data (the body) in the buffer
         size_t headerEnd = bufStr.find("\r\n\r\n") + 4;
         std::string hello;
@@ -533,13 +568,11 @@ void NetThread() {
         // Wait for OpCode 2 (Identified)
         bool authenticated = false;
 
-        DWORD lastPollRec = 0;
-        DWORD lastPollStr = 0;
         DWORD lastPollStats = 0;
         int lastSkippedFrames = -1;
         bool initialPollDone = false;
 
-        while (true) {
+        while (!g_shutdown.load()) {
           DWORD now = GetTickCount();
 
           if (authenticated) {
@@ -571,7 +604,7 @@ void NetThread() {
             if (!authenticated && chunk.find("\"op\":2") != std::string::npos) {
               authenticated = true;
               isConn = true;
-              PostMessage(hMain, WM_OBS, 0, 0);
+              NotifyObsUpdate();
               // Reset state to poll immediately
               initialPollDone = false;
               lastPollStats = 0;
@@ -585,7 +618,7 @@ void NetThread() {
               bool act = chunk.find("\"outputActive\":true") != std::string::npos;
               if (act != isRec) {
                 isRec = act;
-                PostMessage(hMain, WM_OBS, 0, 0);
+                NotifyObsUpdate();
               }
             }
 
@@ -595,7 +628,7 @@ void NetThread() {
               bool act = chunk.find("\"outputActive\":true") != std::string::npos;
               if (act != isStream) {
                 isStream = act;
-                PostMessage(hMain, WM_OBS, 0, 0);
+                NotifyObsUpdate();
               }
             }
 
@@ -603,16 +636,18 @@ void NetThread() {
             if (chunk.find("GetStats") != std::string::npos) {
               std::string skipS = JsonVal(chunk, "outputSkippedFrames");
               if (!skipS.empty()) {
-                int skip = atoi(skipS.c_str());
-                if (lastSkippedFrames != -1 && skip > lastSkippedFrames) {
-                  DWORD n = GetTickCount();
-                  if (n < overloadWarnUntil)
-                    overloadWarnUntil += 5000;
-                  else
-                    overloadWarnUntil = n + 5000;
-                  PostMessage(hMain, WM_OBS, 0, 0);
+                char *end = nullptr;
+                long parsed = strtol(skipS.c_str(), &end, 10);
+                if (end != skipS.c_str()) {
+                  int skip = static_cast<int>(parsed);
+                  if (lastSkippedFrames != -1 && skip > lastSkippedFrames) {
+                    ULONGLONG n = GetTickCount64();
+                    ULONGLONG until = overloadWarnUntil.load();
+                    overloadWarnUntil = (n < until) ? (until + 5000ULL) : (n + 5000ULL);
+                    NotifyObsUpdate();
+                  }
+                  lastSkippedFrames = skip;
                 }
-                lastSkippedFrames = skip;
               }
             }
           }
@@ -620,14 +655,14 @@ void NetThread() {
       }
     }
     closesocket(s);
-    if (isConn) {
+    if (isConn.load()) {
       isConn = false;
       isRec = false;
       isStream = false;
-      PostMessage(hMain, WM_OBS, 0, 0);
+      NotifyObsUpdate();
     }
     overloadWarnUntil = 0;
-    if (!g_shutdown) Sleep(1000);
+    if (!g_shutdown.load()) Sleep(1000);
   }
   
   WSACleanup();  // Cleanup once at thread end
@@ -638,11 +673,12 @@ HFONT hF, hFb;
 // Cached Warning Resources
 HFONT g_hFontWarn = NULL;
 HBITMAP g_hBmWarn = NULL;
+HBITMAP g_hOldWarnBm = NULL;
 HDC g_hdcWarn = NULL;
 SIZE g_sizeWarn = {0, 0};
 std::string g_lastWarnMsg = "";
 
-HBRUSH hBb, hBp, hBr, hBbtn, hBa, hBi;
+HBRUSH hBb, hBp, hBr, hBbtn, hBa;
 struct Hit {
   int id;
   RECT r;
@@ -659,20 +695,45 @@ void InitGDI() {
   hBr = CreateSolidBrush(COL_GRP_BORDER);
   hBbtn = CreateSolidBrush(COL_BTN_FACE);
   hBa = CreateSolidBrush(COL_ACCENT);
-  hBi = CreateSolidBrush(COL_INPUT_BG);
 
   // Initialize Cached Warning Resources
   g_hFontWarn = CreateFontA(-S(40), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
                             0, 0, 0, 0, "Arial");
   HDC hdcScreen = GetDC(NULL);
   g_hdcWarn = CreateCompatibleDC(hdcScreen);
+  if (g_hdcWarn)
+    g_hOldWarnBm = (HBITMAP)GetCurrentObject(g_hdcWarn, OBJ_BITMAP);
   ReleaseDC(NULL, hdcScreen);
+}
+
+void CleanupGDI() {
+  if (g_hdcWarn && g_hOldWarnBm)
+    SelectObject(g_hdcWarn, g_hOldWarnBm);
+  if (g_hBmWarn) {
+    DeleteObject(g_hBmWarn);
+    g_hBmWarn = NULL;
+  }
+  if (g_hdcWarn) {
+    DeleteDC(g_hdcWarn);
+    g_hdcWarn = NULL;
+  }
+  if (g_hFontWarn) {
+    DeleteObject(g_hFontWarn);
+    g_hFontWarn = NULL;
+  }
+  if (hF) DeleteObject(hF);
+  if (hFb) DeleteObject(hFb);
+  if (hBb) DeleteObject(hBb);
+  if (hBp) DeleteObject(hBp);
+  if (hBr) DeleteObject(hBr);
+  if (hBbtn) DeleteObject(hBbtn);
+  if (hBa) DeleteObject(hBa);
 }
 
 void DrawUI(HDC hdc, int w, int h) {
   HDC dc = CreateCompatibleDC(hdc);
   HBITMAP bm = CreateCompatibleBitmap(hdc, w, h);
-  SelectObject(dc, bm);
+  HBITMAP oldBm = (HBITMAP)SelectObject(dc, bm);
   hits.clear();
 
   RECT rBg = {0, 0, w, h};
@@ -704,16 +765,16 @@ void DrawUI(HDC hdc, int w, int h) {
       RECT tr = {r.left + S(10), r.top - S(10),
                  r.left + S(10) + S((int)strlen(t) * 12), r.top + S(5)};
       FillRect(dc, &tr, hBb);
-      TextOutA(dc, r.left + S(15), r.top - S(8), t, strlen(t));
+      TextOutA(dc, r.left + S(15), r.top - S(8), t, static_cast<int>(strlen(t)));
     };
     auto Tick = [&](int id, int x, int y, const char *t, bool c) {
       RECT r = {S(x), S(y), S(x + 20), S(y + 20)};
-      FillRect(dc, &r, hBi);
+      FillRect(dc, &r, hBp);
       if (c) {
         RECT i = {r.left + S(4), r.top + S(4), r.right - S(4), r.bottom - S(4)};
         FillRect(dc, &i, hBa);
       }
-      TextOutA(dc, S(x + 30), S(y), t, strlen(t));
+      TextOutA(dc, S(x + 30), S(y), t, static_cast<int>(strlen(t)));
       // Dynamic Hit Width calculation to avoid overlap
       int estW = S(30 + (int)(strlen(t) * 10)); // 30px checkbox + ~10px per char
       hits.push_back({id, {S(x), S(y), S(x) + estW, S(y + 20)}});
@@ -786,34 +847,35 @@ void DrawUI(HDC hdc, int w, int h) {
     Btn(42, C3, 415, "View License", false);
 
     // Status Line
-    char st[100];
-    COLORREF stCol;
+    const char *st = "Status: Disconnected";
+    COLORREF stCol = COL_STATUS_ERR;
     if (isTest) {
-      strcpy(st, "Status: TEST MODE");
+      st = "Status: TEST MODE";
       stCol = COL_ACCENT;
     } else if (!isConn) {
-      strcpy(st, "Status: Disconnected");
+      st = "Status: Disconnected";
       stCol = COL_STATUS_ERR;
     } else if (isRec || isStream) {
       if (isRec && isStream)
-        strcpy(st, "Status: Rec & Stream Active");
+        st = "Status: Rec & Stream Active";
       else if (isRec)
-        strcpy(st, "Status: Recording Active");
+        st = "Status: Recording Active";
       else
-        strcpy(st, "Status: Streaming Active");
+        st = "Status: Streaming Active";
       stCol = COL_STATUS_REC;
     } else {
-      strcpy(st, "Status: Idle (WebSocket)");
+      st = "Status: Idle (WebSocket)";
       stCol = COL_STATUS_WS;
     }
 
     SetTextColor(dc, stCol);
     SelectObject(dc, hFb);
-    TextOutA(dc, S(C1), h - S(35), st, strlen(st));
+    TextOutA(dc, S(C1), h - S(35), st, static_cast<int>(strlen(st)));
     SelectObject(dc, hF);
   }
 
   BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+  SelectObject(dc, oldBm);
   DeleteObject(bm);
   DeleteDC(dc);
 }
@@ -822,11 +884,22 @@ void DrawUI(HDC hdc, int w, int h) {
 void UpdateLayered(HWND hWnd, int x, int y, int w, int h, BYTE alpha,
                    std::function<void(HDC)> drawFn) {
   HDC hdcScreen = GetDC(NULL);
+  if (!hdcScreen)
+    return;
   HDC hdcMem = CreateCompatibleDC(hdcScreen);
+  if (!hdcMem) {
+    ReleaseDC(NULL, hdcScreen);
+    return;
+  }
   
   // NOTE: CreateCompatibleBitmap with a DC that might be screen.
   // We need to ensure we have a valid bitmap.
   HBITMAP hBm = CreateCompatibleBitmap(hdcScreen, w, h);
+  if (!hBm) {
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+    return;
+  }
   HBITMAP hOldBm = (HBITMAP)SelectObject(hdcMem, hBm);
 
   drawFn(hdcMem);
@@ -957,7 +1030,7 @@ void UpdateOv() {
   }
 
   // Warning Overlay Update
-  bool showOverload = cfg.showOverloadWarn && (GetTickCount() < overloadWarnUntil);
+  bool showOverload = cfg.showOverloadWarn && (GetTickCount64() < overloadWarnUntil.load());
   bool showW = warnVisible || showOverload;
   BYTE warnAlpha = 0;
   bool doUpdateWarn = false;
@@ -988,9 +1061,11 @@ void UpdateOv() {
   }
 
   if (doUpdateWarn) {
-   if (warnAlpha > 0) {
-       if (!IsWindowVisible(hWarn)) ShowWindow(hWarn, SW_SHOWNA);
-       SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!g_hdcWarn)
+      return;
+    if (warnAlpha > 0) {
+        if (!IsWindowVisible(hWarn)) ShowWindow(hWarn, SW_SHOWNA);
+        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
    } else {
        // Hide warning window when not visible (even in ghost mode)
        SetWindowPos(hWarn, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
@@ -1002,29 +1077,43 @@ void UpdateOv() {
    // Position/Size must be recalculated if message changes OR scale changes (which we don't handle dynamic DPI yet fully, but assuming S stays same)
    // Actually, position depends on screen size too. We calculate Pos every frame anyway.
 
-   if (cacheStale) {
-       // 1. Calculate Size
-       HDC hdcScreen = GetDC(NULL);
-       // Use temp DC for measurment
-       HDC dc = CreateCompatibleDC(hdcScreen);
-       SelectObject(dc, g_hFontWarn); // Use cached font
-       RECT rText = {0, 0, 0, 0};
-       DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
+    if (cacheStale) {
+        // 1. Calculate Size
+        HDC hdcScreen = GetDC(NULL);
+        if (!hdcScreen)
+          return;
+        // Use temp DC for measurment
+        HDC dc = CreateCompatibleDC(hdcScreen);
+        if (!dc) {
+          ReleaseDC(NULL, hdcScreen);
+          return;
+        }
+        SelectObject(dc, g_hFontWarn); // Use cached font
+        RECT rText = {0, 0, 0, 0};
+        DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
        int wW = rText.right - rText.left + S(20);
        int wH = rText.bottom - rText.top + S(10);
        DeleteDC(dc);
        
-       // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
-       // FIX: Select bitmap out of DC before deleting to avoid GDI resource leak
-       if (g_hBmWarn) {
-           SelectObject(g_hdcWarn, NULL);
-           DeleteObject(g_hBmWarn);
-       }
-       g_hBmWarn = CreateCompatibleBitmap(hdcScreen, wW, wH);
-       
-       // 3. Draw into Cached Bitmap
-       SelectObject(g_hdcWarn, g_hBmWarn);
-       SelectObject(g_hdcWarn, g_hFontWarn);
+        // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
+        // FIX: Select bitmap out of DC before deleting to avoid GDI resource leak
+        if (g_hBmWarn) {
+            if (g_hOldWarnBm)
+              SelectObject(g_hdcWarn, g_hOldWarnBm);
+            DeleteObject(g_hBmWarn);
+            g_hBmWarn = NULL;
+        }
+        g_hBmWarn = CreateCompatibleBitmap(hdcScreen, wW, wH);
+        if (!g_hBmWarn) {
+            ReleaseDC(NULL, hdcScreen);
+            return;
+        }
+        
+        // 3. Draw into Cached Bitmap
+        HBITMAP oldWarnBm = (HBITMAP)SelectObject(g_hdcWarn, g_hBmWarn);
+        if (!g_hOldWarnBm)
+          g_hOldWarnBm = oldWarnBm;
+        SelectObject(g_hdcWarn, g_hFontWarn);
        SetTextColor(g_hdcWarn, COL_WARN_TEXT);
        SetBkMode(g_hdcWarn, TRANSPARENT);
        
@@ -1162,18 +1251,26 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
   } else if (m == WM_COMMAND && HIWORD(w) == EN_CHANGE) {
     char b[4096];
     GetWindowTextA((HWND)l, b, 4096);
-    if ((HWND)l == hEditPad)
-      cfg.pad = atoi(b);
-    if ((HWND)l == hEditSize)
-      cfg.size = atoi(b);
+    if ((HWND)l == hEditPad || (HWND)l == hEditSize) {
+      char *end = nullptr;
+      long parsed = strtol(b, &end, 10);
+      if (end != b) {
+        if ((HWND)l == hEditPad)
+          cfg.pad = std::clamp(static_cast<int>(parsed), 0, 100);
+        else
+          cfg.size = std::clamp(static_cast<int>(parsed), 10, 200);
+      }
+    }
     if ((HWND)l == hEditPass)
-      ManagePass(b);
+      g_passwordDirty = true;
     if ((HWND)l == hEditProcs) {
       std::string s = b;
       s = ReplaceAll(s, "\r\n", "|");
+      if (s.size() > 2048)
+        s.resize(2048);
       cfg.processList = s;
     }
-    configDirtyTime = GetTickCount() + 1000; // Save in 1s
+    configDirtyTime = GetTickCount64() + 1000; // Save in 1s
     UpdateOv();
     if (isTest)
       InvalidateRect(hOv, NULL, FALSE);
@@ -1189,21 +1286,23 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           cfg.pos = 1;
         if (hit.id == 13)
           cfg.pos = 0;
-        // Removed Shape(20,21) and Color(30-32) handlers
         if (hit.id == 40) {
           cfg.autoStart = !cfg.autoStart;
-          HKEY k;
-          RegOpenKeyExA(HKEY_CURRENT_USER,
-                        "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
-                        KEY_SET_VALUE, &k);
-          if (cfg.autoStart) {
-            char p[MAX_PATH], q[MAX_PATH];
-            GetModuleFileNameA(0, p, MAX_PATH);
-            sprintf(q, "\"%s\" --tray", p);
-            RegSetValueExA(k, "OBSInd", 0, REG_SZ, (BYTE *)q, strlen(q) + 1);
-          } else
-            RegDeleteValueA(k, "OBSInd");
-          RegCloseKey(k);
+          HKEY k = NULL;
+          if (RegOpenKeyExA(HKEY_CURRENT_USER,
+                            "Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0,
+                            KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            if (cfg.autoStart) {
+              char exePath[MAX_PATH], regVal[MAX_PATH];
+              GetModuleFileNameA(0, exePath, MAX_PATH);
+              _snprintf_s(regVal, sizeof(regVal), _TRUNCATE, "\"%s\" --tray", exePath);
+              RegSetValueExA(k, "OBSInd", 0, REG_SZ, (BYTE *)regVal,
+                             (DWORD)(strlen(regVal) + 1));
+            } else {
+              RegDeleteValueA(k, "OBSInd");
+            }
+            RegCloseKey(k);
+          }
         }
         if (hit.id == 41) {
           isTest = !isTest;
@@ -1234,16 +1333,18 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           cfg.ghostModeOnlyWhenGame = !cfg.ghostModeOnlyWhenGame;
         if (hit.id == 57) {
           cfg.boostObsPriority = !cfg.boostObsPriority;
+          g_boostObsPriority = cfg.boostObsPriority;
           if (cfg.boostObsPriority) {
             BoostObsPriorityIfNeeded();
           } else {
             // Reset priority to normal for all OBS processes
             SetProcessPriority("obs64.exe", NORMAL_PRIORITY_CLASS);
+            std::lock_guard<std::mutex> lock(g_boostedPidsMutex);
             g_boostedPids.clear();
           }
         }
 
-        configDirtyTime = GetTickCount() + 1000; // Save in 1s
+        configDirtyTime = GetTickCount64() + 1000; // Save in 1s
         UpdateOv();
         InvalidateRect(h, 0, 0);
         SendMessage(h, WM_SIZE, 0, 0);
@@ -1300,10 +1401,10 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     // Check even if overloadWarnUntil is 0 (connection drop) to clear stuck warning
     if (cfg.showOverloadWarn) {
       // Trigger update when overload expires OR when connection drops (overloadWarnUntil reset to 0)
-      static DWORD lastOverloadWarnUntil = 0;
-      DWORD current = overloadWarnUntil.load();
+      static ULONGLONG lastOverloadWarnUntil = 0;
+      ULONGLONG current = overloadWarnUntil.load();
       if ((lastOverloadWarnUntil > 0 && current == 0) || 
-          (current > 0 && GetTickCount() > current)) {
+          (current > 0 && GetTickCount64() > current)) {
         UpdateOv();
       }
       lastOverloadWarnUntil = current;
@@ -1315,9 +1416,9 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     } // End of TIMER_WARN
 
     // Check for delayed config save
-    if (configDirtyTime > 0 && GetTickCount() > configDirtyTime) {
-        IOCfg(true);
-        configDirtyTime = 0;
+    ULONGLONG dirtyAt = configDirtyTime.load();
+    if (dirtyAt > 0 && GetTickCount64() > dirtyAt) {
+        SaveConfigNow();
     }
 
   } else if (m == WM_OBS) {
@@ -1328,7 +1429,7 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     HDC dc = BeginPaint(h, &ps);
     RECT rc;
     GetClientRect(h, &rc);
-    DrawUI(ps.hdc, rc.right, rc.bottom);
+    DrawUI(dc, rc.right, rc.bottom);
     EndPaint(h, &ps);
   } else if (m == WM_TRAY && l == WM_LBUTTONUP) {
     ShowWindow(h, SW_RESTORE);
@@ -1352,21 +1453,52 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     mmi->ptMinTrackSize = sz;
     mmi->ptMaxTrackSize = sz;
     return 0;
-  } else if (m == WM_CLOSE)
+  } else if (m == WM_CLOSE) {
+    if (configDirtyTime.load() > 0)
+      SaveConfigNow();
+    g_shutdown = true;
+    DestroyWindow(h);
+    return 0;
+  } else if (m == WM_DESTROY) {
+    KillTimer(h, TIMER_WARN);
     PostQuitMessage(0);
+    return 0;
+  }
   return DefWindowProc(h, m, w, l);
 }
 
 int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  if (CreateMutex(0, 1, "OBSIndM") && GetLastError() == ERROR_ALREADY_EXISTS)
+  g_singleInstanceMutex = CreateMutexA(NULL, TRUE, "OBSIndM");
+  if (!g_singleInstanceMutex)
+    return 1;
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(g_singleInstanceMutex);
+    g_singleInstanceMutex = NULL;
     return 0;
+  }
   
   // Set self priority to below normal
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
-  IOCfg(false);
+  IOCfg(false);  // Also sets g_boostObsPriority
   g_Scale = GetDpiForSystem() / 96.0f;
+
+  auto FailStartup = [&]() -> int {
+    if (hMain && IsWindow(hMain))
+      DestroyWindow(hMain);
+    if (hWarn && IsWindow(hWarn))
+      DestroyWindow(hWarn);
+    if (hOv && IsWindow(hOv))
+      DestroyWindow(hOv);
+    CleanupGDI();
+    if (g_singleInstanceMutex) {
+      ReleaseMutex(g_singleInstanceMutex);
+      CloseHandle(g_singleInstanceMutex);
+      g_singleInstanceMutex = NULL;
+    }
+    return 1;
+  };
   
   // Apply initial OBS priority if enabled
   if (cfg.boostObsPriority)
@@ -1374,34 +1506,38 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
 
   InitGDI();
 
-  WNDCLASS wc = {0};
+  WNDCLASS wc = {};
   wc.lpfnWndProc = P;
   wc.hInstance = hI;
   wc.lpszClassName = "O";
-  RegisterClass(&wc);
+  if (!RegisterClass(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    return FailStartup();
   hOv = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT |
                            WS_EX_TOOLWINDOW,
                        "O", "", WS_POPUP, 0, 0, 0, 0, 0, 0, hI, 0);
-  // Do NOT set LWA logic here if we use UpdateLayeredWindow immediately or consistently.
-  // But ULW overrides it anyway.
-
+  if (!hOv)
+    return FailStartup();
 
   // Warning Window Class
-  WNDCLASS wcw = {0};
+  WNDCLASS wcw = {};
   wcw.lpfnWndProc = W;
   wcw.hInstance = hI;
   wcw.lpszClassName = "WARN";
-  RegisterClass(&wcw);
+  if (!RegisterClass(&wcw) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    return FailStartup();
   hWarn = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT |
-                             WS_EX_TOOLWINDOW,
-                         "WARN", "", WS_POPUP, 0, 0, 0, 0, 0, 0, hI, 0);
+                              WS_EX_TOOLWINDOW,
+                          "WARN", "", WS_POPUP, 0, 0, 0, 0, 0, 0, hI, 0);
+  if (!hWarn)
+    return FailStartup();
 
   wc.lpfnWndProc = M;
   wc.lpszClassName = "C";
   wc.hbrBackground = hBb;
   wc.hIcon = LoadIcon(hI, MAKEINTRESOURCE(IDI_MAIN_ICON));
   wc.hCursor = LoadCursor(0, IDC_ARROW);
-  RegisterClass(&wc);
+  if (!RegisterClass(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    return FailStartup();
 
   DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;
   // Window size
@@ -1417,28 +1553,48 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
 
   hMain = CreateWindow("C", "OBS Indicator Settings", style, x, y, winW, winH,
                        0, 0, hI, 0);
+  if (!hMain)
+    return FailStartup();
 
+  nid = {};
+  nid.cbSize = sizeof(nid);
   nid.hWnd = hMain;
   nid.uID = 1;
   nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
   nid.uCallbackMessage = WM_TRAY;
   nid.hIcon = wc.hIcon;
-  strcpy(nid.szTip, "OBS Indicator");
+  strcpy_s(nid.szTip, "OBS Indicator");
   Shell_NotifyIcon(NIM_ADD, &nid);
 
   BOOL darkMode = TRUE;
   DwmSetWindowAttribute(hMain, 20, &darkMode, 4);
-  std::thread(NetThread).detach();
+  g_shutdown = false;
+  g_netThread = std::thread(NetThread);
   if (strstr(p, "--tray"))
     ShowWindow(hMain, SW_HIDE);
   else
     ShowWindow(hMain, SW_SHOW);
 
-  MSG m;
-  while (GetMessage(&m, 0, 0, 0)) {
-    TranslateMessage(&m);
-    DispatchMessage(&m);
+  MSG msg;
+  while (GetMessage(&msg, 0, 0, 0)) {
+    TranslateMessage(&msg);
+    DispatchMessage(&msg);
   }
+
+  g_shutdown = true;
+  if (g_netThread.joinable())
+    g_netThread.join();
+
   Shell_NotifyIcon(NIM_DELETE, &nid);
+  if (hWarn && IsWindow(hWarn))
+    DestroyWindow(hWarn);
+  if (hOv && IsWindow(hOv))
+    DestroyWindow(hOv);
+  CleanupGDI();
+  if (g_singleInstanceMutex) {
+    ReleaseMutex(g_singleInstanceMutex);
+    CloseHandle(g_singleInstanceMutex);
+    g_singleInstanceMutex = NULL;
+  }
   return 0;
 }
