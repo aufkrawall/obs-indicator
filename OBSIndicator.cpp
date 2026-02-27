@@ -37,6 +37,7 @@
 #include <tlhelp32.h>
 #include <uxtheme.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 
 // C++ standard library
 #include <algorithm>
@@ -78,7 +79,7 @@ struct AppState {
   int pos = 0; // 0=BR, 1=BL, 2=TR, 3=TL
   bool autoStart = false;
   int mode = MODE_INFO;
-  std::string processList = ""; // Pipe delimited in memory/ini, newline in edit
+  std::string processList; // Pipe delimited in memory/ini, newline in edit
   bool showOverloadWarn = false;
   bool ghostMode = false;
   bool ghostModeOnlyWhenGame = false;
@@ -112,7 +113,7 @@ HANDLE g_singleInstanceMutex = NULL;
 // Warning Logic State
 bool warnActive = false;
 bool warnTargetFocused = false;
-DWORD warnCycleStart = 0;
+ULONGLONG warnCycleStart = 0;
 bool warnVisible = false;
 
 // Full license text
@@ -135,7 +136,7 @@ const char *LIC_TEXT =
     "THE USE OR OTHER DEALINGS IN THE SOFTWARE.";
 
 // --- HELPERS ---
-int S(int v) { return (int)(v * g_Scale); }
+int S(int v) { return static_cast<int>(static_cast<float>(v) * g_Scale); }
 void Wipe(std::string &s) {
   if (!s.empty())
     SecureZeroMemory(&s[0], s.size());
@@ -186,11 +187,11 @@ bool IsForegroundTarget() {
   // Cache results to ensure zero overhead while the same window is focused
   static DWORD lastPid = 0;
   static bool lastRes = false;
-  static DWORD lastCheckTime = 0;
+  static ULONGLONG lastCheckTime = 0;
 
   // Re-validate string every 2 seconds in case config changed, otherwise trust
   // cache
-  if (pid == lastPid && (GetTickCount() - lastCheckTime < 2000))
+  if (pid == lastPid && (GetTickCount64() - lastCheckTime < 2000))
     return lastRes;
 
   bool match = false;
@@ -225,7 +226,7 @@ bool IsForegroundTarget() {
 
   lastPid = pid;
   lastRes = match;
-  lastCheckTime = GetTickCount();
+  lastCheckTime = GetTickCount64();
   return match;
 }
 
@@ -249,17 +250,16 @@ std::string Base64(const std::vector<BYTE> &data) {
 }
 
 std::vector<BYTE> Sha256(const std::string &data) {
-  HCRYPTPROV hP;
-  HCRYPTHASH hH;
   std::vector<BYTE> hash(32);
-  if (CryptAcquireContext(&hP, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-    if (CryptCreateHash(hP, CALG_SHA_256, 0, 0, &hH)) {
-      CryptHashData(hH, (BYTE *)data.data(), (DWORD)data.size(), 0);
-      DWORD len = 32;
-      CryptGetHashParam(hH, HP_HASHVAL, hash.data(), &len, 0);
-      CryptDestroyHash(hH);
+  BCRYPT_ALG_HANDLE hAlg = NULL;
+  if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0) == 0) {
+    BCRYPT_HASH_HANDLE hHash = NULL;
+    if (BCryptCreateHash(hAlg, &hHash, NULL, 0, NULL, 0, 0) == 0) {
+      BCryptHashData(hHash, (PUCHAR)data.data(), (ULONG)data.size(), 0);
+      BCryptFinishHash(hHash, hash.data(), (ULONG)hash.size(), 0);
+      BCryptDestroyHash(hHash);
     }
-    CryptReleaseContext(hP, 0);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
   }
   return hash;
 }
@@ -299,6 +299,7 @@ std::string ManagePass(const char *newPass = nullptr) {
       Wipe(dec);
       return "";
     }
+    dec.resize(len);
     return dec;
   }
 }
@@ -308,31 +309,33 @@ void IOCfg(bool save) {
   if (!GetIniPath(path))
     return;
   if (save) {
-    WritePrivateProfileStringA("S", "Sz", std::to_string(cfg.size).c_str(),
-                               path);
-    WritePrivateProfileStringA("S", "Pd", std::to_string(cfg.pad).c_str(),
-                               path);
-    WritePrivateProfileStringA("S", "Ps", std::to_string(cfg.pos).c_str(),
-                               path);
-    WritePrivateProfileStringA("S", "Au", cfg.autoStart ? "1" : "0", path);
-    WritePrivateProfileStringA("S", "Md", std::to_string(cfg.mode).c_str(),
-                               path);
-    WritePrivateProfileStringA("S", "Ow", cfg.showOverloadWarn ? "1" : "0",
-                               path);
-    WritePrivateProfileStringA("S", "Gm", cfg.ghostMode ? "1" : "0", path);
-    WritePrivateProfileStringA("S", "Gog", cfg.ghostModeOnlyWhenGame ? "1" : "0", path);
-    WritePrivateProfileStringA("S", "Bop", cfg.boostObsPriority ? "1" : "0", path);
-    WritePrivateProfileStringA("S", "Pr", cfg.processList.c_str(), path);
+    char pwBuf[512] = {0};
+    GetPrivateProfileStringA("S", "Pw", "", pwBuf, 512, path);
+
+    std::string section;
+    section += "Sz=" + std::to_string(cfg.size) + '\0';
+    section += "Pd=" + std::to_string(cfg.pad) + '\0';
+    section += "Ps=" + std::to_string(cfg.pos) + '\0';
+    section += "Au=" + std::string(cfg.autoStart ? "1" : "0") + '\0';
+    section += "Md=" + std::to_string(cfg.mode) + '\0';
+    section += "Ow=" + std::string(cfg.showOverloadWarn ? "1" : "0") + '\0';
+    section += "Gm=" + std::string(cfg.ghostMode ? "1" : "0") + '\0';
+    section += "Gog=" + std::string(cfg.ghostModeOnlyWhenGame ? "1" : "0") + '\0';
+    section += "Bop=" + std::string(cfg.boostObsPriority ? "1" : "0") + '\0';
+    section += "Pw=" + std::string(pwBuf) + '\0';
+    section += "Pr=" + cfg.processList + '\0';
+    section += '\0';
+    WritePrivateProfileSectionA("S", section.c_str(), path);
   } else {
-    cfg.size = GetPrivateProfileIntA("S", "Sz", 30, path);
-    cfg.pad = GetPrivateProfileIntA("S", "Pd", 20, path);
-    cfg.pos = GetPrivateProfileIntA("S", "Ps", 0, path);
+    cfg.size = static_cast<int>(GetPrivateProfileIntA("S", "Sz", 30, path));
+    cfg.pad = static_cast<int>(GetPrivateProfileIntA("S", "Pd", 20, path));
+    cfg.pos = static_cast<int>(GetPrivateProfileIntA("S", "Ps", 0, path));
     cfg.autoStart = GetPrivateProfileIntA("S", "Au", 0, path) == 1;
     cfg.showOverloadWarn = GetPrivateProfileIntA("S", "Ow", 0, path) == 1;
     cfg.ghostMode = GetPrivateProfileIntA("S", "Gm", 0, path) == 1;
     cfg.ghostModeOnlyWhenGame = GetPrivateProfileIntA("S", "Gog", 0, path) == 1;
     cfg.boostObsPriority = GetPrivateProfileIntA("S", "Bop", 0, path) == 1;
-    cfg.mode = GetPrivateProfileIntA("S", "Md", 0, path);
+    cfg.mode = static_cast<int>(GetPrivateProfileIntA("S", "Md", 0, path));
     char buf[4096] = {0};
     GetPrivateProfileStringA("S", "Pr", "", buf, 4096, path);
     cfg.processList = buf;
@@ -397,13 +400,11 @@ void BoostObsPriorityIfNeeded() {
 
   PROCESSENTRY32 pe32;
   pe32.dwSize = sizeof(PROCESSENTRY32);
-  bool foundAny = false;
   std::lock_guard<std::mutex> lock(g_boostedPidsMutex);
 
   if (Process32First(hSnap, &pe32)) {
     do {
       if (_stricmp(pe32.szExeFile, "obs64.exe") == 0) {
-        foundAny = true;
         DWORD pid = pe32.th32ProcessID;
 
         // Check if this PID was already boosted
@@ -429,17 +430,20 @@ void BoostObsPriorityIfNeeded() {
   CloseHandle(hSnap);
   
   // Clean up stale PIDs (processes that no longer exist)
-  if (foundAny) {
-    auto it = g_boostedPids.begin();
-    while (it != g_boostedPids.end()) {
-      HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, *it);
-      if (hProcess) {
-        CloseHandle(hProcess);
-        ++it;
+  auto it = g_boostedPids.begin();
+  while (it != g_boostedPids.end()) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, *it);
+    if (hProcess) {
+      DWORD exitCode = 0;
+      if (GetExitCodeProcess(hProcess, &exitCode) && exitCode != STILL_ACTIVE) {
+          it = g_boostedPids.erase(it);
       } else {
-        // Process no longer exists, remove from tracking
-        it = g_boostedPids.erase(it);
+          ++it;
       }
+      CloseHandle(hProcess);
+    } else {
+      // Process no longer exists, remove from tracking
+      it = g_boostedPids.erase(it);
     }
   }
 }
@@ -454,7 +458,7 @@ std::string JsonVal(const std::string &json, const std::string &key) {
   if (p == std::string::npos)
     return "";
   p++; // Move past the colon
-  while (p < json.size() && (isspace(json[p]) || json[p] == '"'))
+  while (p < json.size() && (isspace(static_cast<unsigned char>(json[p])) || json[p] == '"'))
     p++;
   size_t e = p;
   while (e < json.size() && json[e] != '"' && json[e] != ',' && json[e] != '}')
@@ -471,12 +475,12 @@ void SendWS(SOCKET s, const std::string &txt) {
   } else
     f.push_back(0x80 | (BYTE)txt.size());
 
-  DWORD m = GetTickCount();
+  DWORD m = (DWORD)GetTickCount64();
   BYTE mask[4];
   memcpy(mask, &m, 4);
   f.insert(f.end(), mask, mask + 4);
   for (size_t i = 0; i < txt.size(); i++)
-    f.push_back(txt[i] ^ mask[i % 4]);
+    f.push_back(static_cast<BYTE>(txt[i] ^ mask[i % 4]));
   send(s, (char *)f.data(), (int)f.size(), 0);
 }
 
@@ -531,7 +535,7 @@ void NetThread() {
         int r = recv(s, buf, sizeof(buf), 0);
         if (r <= 0)
           break;
-        bufStr.append(buf, r);
+        bufStr.append(buf, static_cast<size_t>(r));
 
         if (bufStr.find("\r\n\r\n") != std::string::npos) {
           handshakeDone = true;
@@ -541,39 +545,141 @@ void NetThread() {
       if (handshakeDone && bufStr.find("HTTP/1.1 101") != std::string::npos) {
         // Check if we have extra data (the body) in the buffer
         size_t headerEnd = bufStr.find("\r\n\r\n") + 4;
-        std::string hello;
+        std::vector<BYTE> wsBuffer;
 
         if (headerEnd < bufStr.size()) {
-          // Body was partially or fully read with headers
-          hello = bufStr.substr(headerEnd);
-        } else {
-          // Body needs to be read
-          int n = recv(s, buf, 4096, 0);
-          if (n > 0)
-            hello.assign(buf, n);
+          wsBuffer.insert(wsBuffer.end(), bufStr.begin() + static_cast<std::string::difference_type>(headerEnd), bufStr.end());
         }
 
-        std::string salt = JsonVal(hello, "salt"),
-                    chal = JsonVal(hello, "challenge");
-
-        std::string id =
-            "{\"op\":1,\"d\":{\"rpcVersion\":1,\"eventSubscriptions\":65";
-        if (!salt.empty() && !chal.empty()) {
-          std::string p = ManagePass();
-          id += ",\"authentication\":\"" + Auth(p, salt, chal) + "\"";
-        }
-        id += "}}";
-        SendWS(s, id);
-
-        // Wait for OpCode 2 (Identified)
+        // Wait for OpCode 0 (Hello) and OpCode 2 (Identified)
         bool authenticated = false;
+        bool helloReceived = false;
 
-        DWORD lastPollStats = 0;
+        ULONGLONG lastPollStats = 0;
         int lastSkippedFrames = -1;
         bool initialPollDone = false;
 
+        auto processWsFrames = [&]() -> bool {
+          while (wsBuffer.size() >= 2) {
+            BYTE b0 = wsBuffer[0];
+            BYTE b1 = wsBuffer[1];
+            BYTE opcode = b0 & 0x0F;
+            bool masked = (b1 & 0x80) != 0;
+            uint64_t payloadLen = b1 & 0x7F;
+            size_t headerLen = 2;
+
+            if (payloadLen == 126) {
+              if (wsBuffer.size() < 4)
+                break;
+              payloadLen = static_cast<uint64_t>(wsBuffer[2] << 8) | wsBuffer[3];
+              headerLen = 4;
+            } else if (payloadLen == 127) {
+              if (wsBuffer.size() < 10)
+                break;
+              payloadLen = 0;
+              for (size_t i = 0; i < 8; i++) {
+                payloadLen = (payloadLen << 8) | wsBuffer[2 + i];
+              }
+              headerLen = 10;
+            }
+
+            // Guard against absurd payloads (max 1MB for OBS JSON messages)
+            if (payloadLen > 1048576)
+              return true;
+
+            BYTE mask[4] = {0};
+            if (masked) {
+              if (wsBuffer.size() < headerLen + 4)
+                break;
+              memcpy(mask, &wsBuffer[headerLen], 4);
+              headerLen += 4;
+            }
+
+            if (wsBuffer.size() < headerLen + static_cast<size_t>(payloadLen))
+              break;
+
+            if (opcode == 0x8) {
+              return true;
+            }
+
+            if (opcode == 0x1 || opcode == 0x2) {
+              size_t len = static_cast<size_t>(payloadLen);
+              std::string chunk;
+              chunk.resize(len);
+              for (size_t i = 0; i < len; i++) {
+                chunk[i] = static_cast<char>(wsBuffer[headerLen + i] ^ (masked ? mask[i % 4] : 0));
+              }
+
+              std::string op = JsonVal(chunk, "op");
+
+              if (!helloReceived && op == "0") {
+                helloReceived = true;
+                std::string salt = JsonVal(chunk, "salt"),
+                            chal = JsonVal(chunk, "challenge");
+
+                std::string id =
+                    "{\"op\":1,\"d\":{\"rpcVersion\":1,\"eventSubscriptions\":65";
+                if (!salt.empty() && !chal.empty()) {
+                  std::string p = ManagePass();
+                  id += ",\"authentication\":\"" + Auth(p, salt, chal) + "\"";
+                }
+                id += "}}";
+                SendWS(s, id);
+              }
+
+              if (!authenticated && op == "2") {
+                authenticated = true;
+                isConn = true;
+                NotifyObsUpdate();
+                initialPollDone = false;
+                lastPollStats = 0;
+                BoostObsPriorityIfNeeded();
+              }
+
+              if (chunk.find("RecordStateChanged") != std::string::npos ||
+                  chunk.find("GetRecordStatus") != std::string::npos) {
+                bool act = chunk.find("\"outputActive\":true") != std::string::npos;
+                if (act != isRec) {
+                  isRec = act;
+                  NotifyObsUpdate();
+                }
+              }
+
+              if (chunk.find("StreamStateChanged") != std::string::npos ||
+                  chunk.find("GetStreamStatus") != std::string::npos) {
+                bool act = chunk.find("\"outputActive\":true") != std::string::npos;
+                if (act != isStream) {
+                  isStream = act;
+                  NotifyObsUpdate();
+                }
+              }
+
+              if (chunk.find("GetStats") != std::string::npos) {
+                std::string skipS = JsonVal(chunk, "outputSkippedFrames");
+                if (!skipS.empty()) {
+                  char *end = nullptr;
+                  long parsed = strtol(skipS.c_str(), &end, 10);
+                  if (end != skipS.c_str()) {
+                    int skip = static_cast<int>(parsed);
+                    if (lastSkippedFrames != -1 && skip > lastSkippedFrames) {
+                      ULONGLONG n = GetTickCount64();
+                      overloadWarnUntil = n + 5000ULL;
+                      NotifyObsUpdate();
+                    }
+                    lastSkippedFrames = skip;
+                  }
+                }
+              }
+            }
+
+            wsBuffer.erase(wsBuffer.begin(), wsBuffer.begin() + static_cast<std::vector<BYTE>::difference_type>(headerLen + static_cast<size_t>(payloadLen)));
+          }
+
+          return false;
+        };
+
         while (!g_shutdown.load()) {
-          DWORD now = GetTickCount();
+          ULONGLONG now = GetTickCount64();
 
           if (authenticated) {
             // Initial poll to get current state (only once)
@@ -590,6 +696,9 @@ void NetThread() {
             }
           }
 
+          if (processWsFrames())
+            break;
+
           timeval tv = {0, 100000};
           fd_set fds;
           FD_ZERO(&fds);
@@ -598,58 +707,10 @@ void NetThread() {
             int r = recv(s, buf, 4096, 0);
             if (r <= 0)
               break;
-            std::string chunk(buf, r);
+            wsBuffer.insert(wsBuffer.end(), buf, buf + r);
 
-            // Check for Identification Success (OpCode 2)
-            if (!authenticated && chunk.find("\"op\":2") != std::string::npos) {
-              authenticated = true;
-              isConn = true;
-              NotifyObsUpdate();
-              // Reset state to poll immediately
-              initialPollDone = false;
-              lastPollStats = 0;
-              // Boost OBS priority if enabled (connection established means OBS is running)
-              BoostObsPriorityIfNeeded();
-            }
-
-            // Check Recording Status
-            if (chunk.find("RecordStateChanged") != std::string::npos ||
-                chunk.find("GetRecordStatus") != std::string::npos) {
-              bool act = chunk.find("\"outputActive\":true") != std::string::npos;
-              if (act != isRec) {
-                isRec = act;
-                NotifyObsUpdate();
-              }
-            }
-
-            // Check Streaming Status
-            if (chunk.find("StreamStateChanged") != std::string::npos ||
-                chunk.find("GetStreamStatus") != std::string::npos) {
-              bool act = chunk.find("\"outputActive\":true") != std::string::npos;
-              if (act != isStream) {
-                isStream = act;
-                NotifyObsUpdate();
-              }
-            }
-
-            // Check Stats (Encoder Overload)
-            if (chunk.find("GetStats") != std::string::npos) {
-              std::string skipS = JsonVal(chunk, "outputSkippedFrames");
-              if (!skipS.empty()) {
-                char *end = nullptr;
-                long parsed = strtol(skipS.c_str(), &end, 10);
-                if (end != skipS.c_str()) {
-                  int skip = static_cast<int>(parsed);
-                  if (lastSkippedFrames != -1 && skip > lastSkippedFrames) {
-                    ULONGLONG n = GetTickCount64();
-                    ULONGLONG until = overloadWarnUntil.load();
-                    overloadWarnUntil = (n < until) ? (until + 5000ULL) : (n + 5000ULL);
-                    NotifyObsUpdate();
-                  }
-                  lastSkippedFrames = skip;
-                }
-              }
-            }
+            if (processWsFrames())
+              break;
           }
         }
       }
@@ -676,7 +737,7 @@ HBITMAP g_hBmWarn = NULL;
 HBITMAP g_hOldWarnBm = NULL;
 HDC g_hdcWarn = NULL;
 SIZE g_sizeWarn = {0, 0};
-std::string g_lastWarnMsg = "";
+std::string g_lastWarnMsg;
 
 HBRUSH hBb, hBp, hBr, hBbtn, hBa;
 struct Hit {
@@ -739,7 +800,7 @@ void DrawUI(HDC hdc, int w, int h) {
   RECT rBg = {0, 0, w, h};
   FillRect(dc, &rBg, hBb);
   SetBkMode(dc, TRANSPARENT);
-  SelectObject(dc, hF);
+  HFONT oldFont = (HFONT)SelectObject(dc, hF);
   SetTextColor(dc, COL_TEXT);
 
   if (showLic || showProcList) {
@@ -849,16 +910,21 @@ void DrawUI(HDC hdc, int w, int h) {
     // Status Line
     const char *st = "Status: Disconnected";
     COLORREF stCol = COL_STATUS_ERR;
-    if (isTest) {
+    bool test = isTest.load();
+    bool rec = isRec.load();
+    bool stream = isStream.load();
+    bool conn = isConn.load();
+
+    if (test) {
       st = "Status: TEST MODE";
       stCol = COL_ACCENT;
-    } else if (!isConn) {
+    } else if (!conn) {
       st = "Status: Disconnected";
       stCol = COL_STATUS_ERR;
-    } else if (isRec || isStream) {
-      if (isRec && isStream)
+    } else if (rec || stream) {
+      if (rec && stream)
         st = "Status: Rec & Stream Active";
-      else if (isRec)
+      else if (rec)
         st = "Status: Recording Active";
       else
         st = "Status: Streaming Active";
@@ -871,10 +937,10 @@ void DrawUI(HDC hdc, int w, int h) {
     SetTextColor(dc, stCol);
     SelectObject(dc, hFb);
     TextOutA(dc, S(C1), h - S(35), st, static_cast<int>(strlen(st)));
-    SelectObject(dc, hF);
   }
 
   BitBlt(hdc, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+  SelectObject(dc, oldFont);
   SelectObject(dc, oldBm);
   DeleteObject(bm);
   DeleteDC(dc);
@@ -957,9 +1023,14 @@ void UpdateOv() {
   else { pixX = fullS - 1; pixY = fullS - 1; } // BR -> WinW-1, WinH-1
 
   // Logic for Info Indicator Visibility
-  bool active = isRec || isStream;
+  bool test = isTest.load();
+  bool rec = isRec.load();
+  bool stream = isStream.load();
+  bool conn = isConn.load();
+
+  bool active = rec || stream;
   bool showInd = false;
-  if (isTest)
+  if (test)
     showInd = true;
   else if (active && cfg.mode != MODE_WARN_ONLY)
     showInd = true;
@@ -978,8 +1049,8 @@ void UpdateOv() {
 
   // Determine current color for change detection
   COLORREF curCol = RGB(255, 0, 0);
-  if (isTest || isRec || isStream) curCol = RGB(255, 0, 0);
-  else if (isConn) curCol = RGB(0, 100, 255); // Blue
+  if (test || rec || stream) curCol = RGB(255, 0, 0);
+  else if (conn) curCol = RGB(0, 100, 255); // Blue
   else curCol = RGB(100, 100, 100); // Gray
 
   static COLORREF lastCol = 0;
@@ -1039,7 +1110,7 @@ void UpdateOv() {
 
   // We need to calculate position and size every time because text might change or pos might change
   // But we can cache the last text/state to avoid ULW calls.
-  static std::string lastMsg = "";
+  static std::string lastMsg;
 
   if (ghostActive) {
       // In ghost mode: warning window uses alpha=0 when hidden (100% invisible)
@@ -1088,11 +1159,12 @@ void UpdateOv() {
           ReleaseDC(NULL, hdcScreen);
           return;
         }
-        SelectObject(dc, g_hFontWarn); // Use cached font
+        HFONT oldFont = (HFONT)SelectObject(dc, g_hFontWarn); // Use cached font
         RECT rText = {0, 0, 0, 0};
         DrawTextA(dc, msg, -1, &rText, DT_CALCRECT);
        int wW = rText.right - rText.left + S(20);
        int wH = rText.bottom - rText.top + S(10);
+       SelectObject(dc, oldFont);
        DeleteDC(dc);
        
         // 2. Re-allocate Bitmap if needed (or if size grew? Just strict realloc for simplicity)
@@ -1181,7 +1253,7 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto Edit = [&](int id, const char *t, bool p = 0) {
       return CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", t,
                              WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL |
-                                 (p ? ES_PASSWORD : ES_NUMBER | ES_CENTER),
+                                 (p ? ES_PASSWORD : (ES_NUMBER | ES_CENTER)),
                              0, 0, 0, 0, h, (HMENU)(INT_PTR)id, 0, 0);
     };
     hEditPad = Edit(100, std::to_string(cfg.pad).c_str());
@@ -1354,15 +1426,15 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
   } else if (m == WM_TIMER) {
     if (w == TIMER_WARN) {
       if (cfg.mode == MODE_WARN || cfg.mode == MODE_WARN_ONLY) {
-      DWORD now = GetTickCount();
+      ULONGLONG now = GetTickCount64();
 
       // Check Focus Every Timer Tick (cached, low overhead)
       warnTargetFocused = IsForegroundTarget();
 
       // Warning Condition: Process Focused AND Not Recording AND Not Streaming
       // (and not in Test mode)
-      bool active = isRec || isStream;
-      bool condition = warnTargetFocused && !active && !isTest;
+      bool active = isRec.load() || isStream.load();
+      bool condition = warnTargetFocused && !active && !isTest.load();
 
       if (condition) {
         // If just started warning state
@@ -1373,8 +1445,8 @@ LRESULT CALLBACK M(HWND h, UINT m, WPARAM w, LPARAM l) {
           UpdateOv();
         } else {
           // Cycle: 2s ON, 1s OFF = 3s total
-          DWORD elapsed = now - warnCycleStart;
-          DWORD cycleTime = elapsed % 3000;
+          ULONGLONG elapsed = now - warnCycleStart;
+          ULONGLONG cycleTime = elapsed % 3000;
           bool shouldBeVisible = (cycleTime < 2000);
           if (warnVisible != shouldBeVisible) {
             warnVisible = shouldBeVisible;
@@ -1482,7 +1554,7 @@ int WINAPI WinMain(HINSTANCE hI, HINSTANCE, LPSTR p, int) {
   SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
 
   IOCfg(false);  // Also sets g_boostObsPriority
-  g_Scale = GetDpiForSystem() / 96.0f;
+  g_Scale = static_cast<float>(GetDpiForSystem()) / 96.0f;
 
   auto FailStartup = [&]() -> int {
     if (hMain && IsWindow(hMain))
